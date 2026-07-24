@@ -168,13 +168,33 @@ def get_optimizer_scheduler(net, cfg):
             else:
                 print(n)
     else:
+        # VDRM is inserted inside the backbone for access to intermediate
+        # tokens, but it is a newly initialized module and must use the main
+        # learning rate rather than the reduced pretrained-backbone rate.
         param_dicts = [
-            {"params": [p for n, p in net.named_parameters() if "backbone" not in n and p.requires_grad]},
             {
-                "params": [p for n, p in net.named_parameters() if "backbone" in n and p.requires_grad],
+                "params": [
+                    p for n, p in net.named_parameters()
+                    if "backbone" not in n and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p for n, p in net.named_parameters()
+                    if "backbone.vdrm" in n and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p for n, p in net.named_parameters()
+                    if "backbone" in n
+                    and "backbone.vdrm" not in n
+                    and p.requires_grad
+                ],
                 "lr": cfg.TRAIN.LR * cfg.TRAIN.BACKBONE_MULTIPLIER,
             },
         ]
+        param_dicts = [group for group in param_dicts if group["params"]]
         if is_main_process():
             print("Learnable parameters are shown below.")
             for n, p in net.named_parameters():

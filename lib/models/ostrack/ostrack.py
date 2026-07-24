@@ -18,7 +18,8 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 class OSTrack(nn.Module):
     """ This is the base class for OSTrack """
 
-    def __init__(self, transformer, box_head, aux_loss=False, head_type="CORNER"):
+    def __init__(self, transformer, box_head, aux_loss=False, head_type="CORNER",
+                 vdrm_enabled=False):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture.
@@ -30,6 +31,7 @@ class OSTrack(nn.Module):
 
         self.aux_loss = aux_loss
         self.head_type = head_type
+        self.vdrm_enabled = vdrm_enabled
         if head_type == "CORNER" or head_type == "CENTER":
             self.feat_sz_s = int(box_head.feat_sz)
             self.feat_len_s = int(box_head.feat_sz ** 2)
@@ -41,11 +43,13 @@ class OSTrack(nn.Module):
                 search: torch.Tensor,
                 ce_template_mask=None,
                 ce_keep_rate=None,
+                template_bbox=None,
                 return_last_attn=False,
                 ):
         x, aux_dict = self.backbone(z=template, x=search,
                                     ce_template_mask=ce_template_mask,
                                     ce_keep_rate=ce_keep_rate,
+                                    template_bbox=template_bbox,
                                     return_last_attn=return_last_attn, )
 
         # Forward head
@@ -79,7 +83,15 @@ class OSTrack(nn.Module):
 
         elif self.head_type == "CENTER":
             # run the center head
-            score_map_ctr, bbox, size_map, offset_map = self.box_head(opt_feat, gt_score_map)
+            center_output = self.box_head(
+                opt_feat,
+                gt_score_map,
+                return_score_logits=self.vdrm_enabled,
+            )
+            if self.vdrm_enabled:
+                score_map_ctr, bbox, size_map, offset_map, score_logits = center_output
+            else:
+                score_map_ctr, bbox, size_map, offset_map = center_output
             # outputs_coord = box_xyxy_to_cxcywh(bbox)
             outputs_coord = bbox
             outputs_coord_new = outputs_coord.view(bs, Nq, 4)
@@ -87,6 +99,8 @@ class OSTrack(nn.Module):
                    'score_map': score_map_ctr,
                    'size_map': size_map,
                    'offset_map': offset_map}
+            if self.vdrm_enabled:
+                out['score_logits'] = score_logits
             return out
         else:
             raise NotImplementedError
@@ -95,6 +109,12 @@ class OSTrack(nn.Module):
 def build_ostrack(cfg, training=True):
     current_dir = os.path.dirname(os.path.abspath(__file__))  # This is your Project Root
     pretrained_path = os.path.join(current_dir, '../../../pretrained_models')
+    vdrm_cfg = getattr(cfg.MODEL, "VDRM", None)
+    vdrm_enabled = bool(vdrm_cfg is not None and vdrm_cfg.ENABLED)
+    if vdrm_enabled and cfg.MODEL.HEAD.TYPE != "CENTER":
+        raise ValueError("VDRM-v1 requires MODEL.HEAD.TYPE='CENTER'")
+    if vdrm_enabled and not cfg.MODEL.BACKBONE.TYPE.endswith("_ce"):
+        raise ValueError("VDRM-v1 currently requires an OSTrack CE backbone")
     if cfg.MODEL.PRETRAIN_FILE and ('OSTrack' not in cfg.MODEL.PRETRAIN_FILE) and training:
         pretrained = os.path.join(pretrained_path, cfg.MODEL.PRETRAIN_FILE)
     else:
@@ -106,17 +126,33 @@ def build_ostrack(cfg, training=True):
         patch_start_index = 1
 
     elif cfg.MODEL.BACKBONE.TYPE == 'vit_base_patch16_224_ce':
+        if vdrm_enabled and cfg.MODEL.BACKBONE.CAT_MODE != 'direct':
+            raise ValueError("VDRM-v1 requires MODEL.BACKBONE.CAT_MODE='direct'")
         backbone = vit_base_patch16_224_ce(pretrained, drop_path_rate=cfg.TRAIN.DROP_PATH_RATE,
                                            ce_loc=cfg.MODEL.BACKBONE.CE_LOC,
                                            ce_keep_ratio=cfg.MODEL.BACKBONE.CE_KEEP_RATIO,
+                                           vdrm_enabled=vdrm_enabled,
+                                           vdrm_insert_layer=vdrm_cfg.INSERT_LAYER if vdrm_enabled else 6,
+                                           vdrm_num_parts=vdrm_cfg.NUM_PARTS if vdrm_enabled else 4,
+                                           vdrm_topk=vdrm_cfg.TOPK if vdrm_enabled else 4,
+                                           vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
+                                           vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                            )
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
 
     elif cfg.MODEL.BACKBONE.TYPE == 'vit_large_patch16_224_ce':
+        if vdrm_enabled and cfg.MODEL.BACKBONE.CAT_MODE != 'direct':
+            raise ValueError("VDRM-v1 requires MODEL.BACKBONE.CAT_MODE='direct'")
         backbone = vit_large_patch16_224_ce(pretrained, drop_path_rate=cfg.TRAIN.DROP_PATH_RATE,
                                             ce_loc=cfg.MODEL.BACKBONE.CE_LOC,
                                             ce_keep_ratio=cfg.MODEL.BACKBONE.CE_KEEP_RATIO,
+                                            vdrm_enabled=vdrm_enabled,
+                                            vdrm_insert_layer=vdrm_cfg.INSERT_LAYER if vdrm_enabled else 6,
+                                            vdrm_num_parts=vdrm_cfg.NUM_PARTS if vdrm_enabled else 4,
+                                            vdrm_topk=vdrm_cfg.TOPK if vdrm_enabled else 4,
+                                            vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
+                                            vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                             )
 
         hidden_dim = backbone.embed_dim
@@ -134,6 +170,7 @@ def build_ostrack(cfg, training=True):
         box_head,
         aux_loss=False,
         head_type=cfg.MODEL.HEAD.TYPE,
+        vdrm_enabled=vdrm_enabled,
     )
 
     if 'OSTrack' in cfg.MODEL.PRETRAIN_FILE and training:

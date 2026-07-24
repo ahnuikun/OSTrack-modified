@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from timm.layers import to_2tuple
 
 from lib.models.layers.patch_embed import PatchEmbed
+from lib.models.layers.vdrm import VisibilityDrivenRepresentationModule
 from .utils import combine_tokens, recover_tokens
 from .vit import VisionTransformer
 from ..layers.attn_blocks import CEBlock
@@ -32,7 +33,10 @@ class VisionTransformerCE(VisionTransformer):
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
                  act_layer=None, weight_init='',
-                 ce_loc=None, ce_keep_ratio=None):
+                 ce_loc=None, ce_keep_ratio=None,
+                 vdrm_enabled=False, vdrm_insert_layer=6, vdrm_num_parts=4,
+                 vdrm_topk=4, vdrm_initial_match_scale=5.0,
+                 vdrm_initial_match_bias=-2.5):
         """
         Args:
             img_size (int, tuple): input image size
@@ -97,10 +101,28 @@ class VisionTransformerCE(VisionTransformer):
         self.blocks = nn.Sequential(*blocks)
         self.norm = norm_layer(embed_dim)
 
+        self.vdrm_enabled = vdrm_enabled
+        self.vdrm_insert_index = vdrm_insert_layer - 1
+        if self.vdrm_enabled:
+            if not 0 <= self.vdrm_insert_index < depth:
+                raise ValueError(
+                    f"VDRM insert layer must be in [1, {depth}], "
+                    f"got {vdrm_insert_layer}"
+                )
+            self.vdrm = VisibilityDrivenRepresentationModule(
+                num_parts=vdrm_num_parts,
+                topk=vdrm_topk,
+                initial_match_scale=vdrm_initial_match_scale,
+                initial_match_bias=vdrm_initial_match_bias,
+            )
+        else:
+            self.vdrm = None
+
         self.init_weights(weight_init)
 
     def forward_features(self, z, x, mask_z=None, mask_x=None,
                          ce_template_mask=None, ce_keep_rate=None,
+                         template_bbox=None,
                          return_last_attn=False
                          ):
         B, H, W = x.shape[0], x.shape[2], x.shape[3]
@@ -146,12 +168,20 @@ class VisionTransformerCE(VisionTransformer):
         global_index_s = torch.linspace(0, lens_x - 1, lens_x).to(x.device)
         global_index_s = global_index_s.repeat(B, 1)
         removed_indexes_s = []
+        vdrm_diagnostics = {}
         for i, blk in enumerate(self.blocks):
             x, global_index_t, global_index_s, removed_index_s, attn = \
                 blk(x, global_index_t, global_index_s, mask_x, ce_template_mask, ce_keep_rate)
 
             if self.ce_loc is not None and i in self.ce_loc:
                 removed_indexes_s.append(removed_index_s)
+
+            if self.vdrm is not None and i == self.vdrm_insert_index:
+                x, vdrm_diagnostics = self.vdrm(
+                    x,
+                    template_length=global_index_t.shape[1],
+                    template_bbox=template_bbox,
+                )
 
         x = self.norm(x)
         lens_x_new = global_index_s.shape[1]
@@ -181,14 +211,22 @@ class VisionTransformerCE(VisionTransformer):
             "attn": attn,
             "removed_indexes_s": removed_indexes_s,  # used for visualization
         }
+        aux_dict.update(vdrm_diagnostics)
 
         return x, aux_dict
 
     def forward(self, z, x, ce_template_mask=None, ce_keep_rate=None,
+                template_bbox=None,
                 tnc_keep_rate=None,
                 return_last_attn=False):
 
-        x, aux_dict = self.forward_features(z, x, ce_template_mask=ce_template_mask, ce_keep_rate=ce_keep_rate,)
+        x, aux_dict = self.forward_features(
+            z,
+            x,
+            ce_template_mask=ce_template_mask,
+            ce_keep_rate=ce_keep_rate,
+            template_bbox=template_bbox,
+        )
 
         return x, aux_dict
 

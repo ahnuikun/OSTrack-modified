@@ -58,10 +58,16 @@ class OSTrack(BaseTracker):
             self.z_dict1 = template
 
         self.box_mask_z = None
-        if self.cfg.MODEL.BACKBONE.CE_LOC:
+        self.vdrm_template_bbox = None
+        vdrm_cfg = getattr(self.cfg.MODEL, "VDRM", None)
+        vdrm_enabled = bool(vdrm_cfg is not None and vdrm_cfg.ENABLED)
+        if self.cfg.MODEL.BACKBONE.CE_LOC or vdrm_enabled:
             template_bbox = self.transform_bbox_to_crop(info['init_bbox'], resize_factor,
                                                         template.tensors.device).squeeze(1)
+        if self.cfg.MODEL.BACKBONE.CE_LOC:
             self.box_mask_z = generate_mask_cond(self.cfg, 1, template.tensors.device, template_bbox)
+        if vdrm_enabled:
+            self.vdrm_template_bbox = template_bbox
 
         # save states
         self.state = info['init_bbox']
@@ -83,10 +89,18 @@ class OSTrack(BaseTracker):
             # merge the template and the search
             # run the transformer
             out_dict = self.network.forward(
-                template=self.z_dict1.tensors, search=x_dict.tensors, ce_template_mask=self.box_mask_z)
+                template=self.z_dict1.tensors,
+                search=x_dict.tensors,
+                ce_template_mask=self.box_mask_z,
+                template_bbox=self.vdrm_template_bbox,
+            )
 
         # add hann windows
         pred_score_map = out_dict['score_map']
+        max_score = pred_score_map.max().detach().item()
+        visual_reliability = out_dict.get('visual_reliability')
+        if visual_reliability is not None:
+            visual_reliability = visual_reliability.detach().mean().item()
         response = self.output_window * pred_score_map
         pred_boxes = self.network.box_head.cal_bbox(response, out_dict['size_map'], out_dict['offset_map'])
         pred_boxes = pred_boxes.view(-1, 4)
@@ -128,9 +142,17 @@ class OSTrack(BaseTracker):
             all_boxes = self.map_box_back_batch(pred_boxes * self.params.search_size / resize_factor, resize_factor)
             all_boxes_save = all_boxes.view(-1).tolist()  # (4N, )
             return {"target_bbox": self.state,
-                    "all_boxes": all_boxes_save}
+                    "all_boxes": all_boxes_save,
+                    "score": max_score,
+                    "response_map": pred_score_map.detach(),
+                    "visual_reliability": visual_reliability}
         else:
-            return {"target_bbox": self.state}
+            return {
+                "target_bbox": self.state,
+                "score": max_score,
+                "response_map": pred_score_map.detach(),
+                "visual_reliability": visual_reliability,
+            }
 
     def map_box_back(self, pred_box: list, resize_factor: float):
         cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]

@@ -127,9 +127,15 @@ class CenterPredictor(nn.Module, ):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x, gt_score_map=None):
+    def forward(self, x, gt_score_map=None, return_score_logits=False):
         """ Forward pass with input x. """
-        score_map_ctr, size_map, offset_map = self.get_score_map(x)
+        score_output = self.get_score_map(
+            x, return_score_logits=return_score_logits
+        )
+        if return_score_logits:
+            score_map_ctr, size_map, offset_map, score_logits = score_output
+        else:
+            score_map_ctr, size_map, offset_map = score_output
 
         # assert gt_score_map is None
         if gt_score_map is None:
@@ -137,6 +143,8 @@ class CenterPredictor(nn.Module, ):
         else:
             bbox = self.cal_bbox(gt_score_map.unsqueeze(1), size_map, offset_map)
 
+        if return_score_logits:
+            return score_map_ctr, bbox, size_map, offset_map, score_logits
         return score_map_ctr, bbox, size_map, offset_map
 
     def cal_bbox(self, score_map_ctr, size_map, offset_map, return_score=False):
@@ -172,10 +180,10 @@ class CenterPredictor(nn.Module, ):
         #                   idx_x + size[:, 0] / 2, idx_y + size[:, 1] / 2], dim=1) / self.feat_sz
         return size * self.feat_sz, offset
 
-    def get_score_map(self, x):
+    def get_score_map(self, x, return_score_logits=False):
 
         def _sigmoid(x):
-            y = torch.clamp(x.sigmoid_(), min=1e-4, max=1 - 1e-4)
+            y = torch.clamp(x.sigmoid(), min=1e-4, max=1 - 1e-4)
             return y
 
         # ctr branch
@@ -183,7 +191,7 @@ class CenterPredictor(nn.Module, ):
         x_ctr2 = self.conv2_ctr(x_ctr1)
         x_ctr3 = self.conv3_ctr(x_ctr2)
         x_ctr4 = self.conv4_ctr(x_ctr3)
-        score_map_ctr = self.conv5_ctr(x_ctr4)
+        score_logits = self.conv5_ctr(x_ctr4)
 
         # offset branch
         x_offset1 = self.conv1_offset(x)
@@ -198,7 +206,14 @@ class CenterPredictor(nn.Module, ):
         x_size3 = self.conv3_size(x_size2)
         x_size4 = self.conv4_size(x_size3)
         score_map_size = self.conv5_size(x_size4)
-        return _sigmoid(score_map_ctr), _sigmoid(score_map_size), score_map_offset
+        result = (
+            _sigmoid(score_logits),
+            _sigmoid(score_map_size),
+            score_map_offset,
+        )
+        if return_score_logits:
+            return result + (score_logits,)
+        return result
 
 
 class MLP(nn.Module):

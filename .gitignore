@@ -178,6 +178,9 @@ cython_debug/
 *.lmdb
 *.mdb
 
+# /data/ above is anchored to the repository root. The source directory
+# lib/train/data remains tracked while Python caches stay ignored.
+
 ltr/run_ltr_local.py
 ltr/train_settings/*/debug.py
 pytracking/parameter/*/debug.py
