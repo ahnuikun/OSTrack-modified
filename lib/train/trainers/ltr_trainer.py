@@ -194,11 +194,10 @@ class LTRTrainer(BaseTrainer):
                     # else:
                     #     print_str += '%s: %r  ,  ' % (name, val)
 
-            if self.settings.local_rank in [-1, 0]:
-                print(print_str[:-5])
-                log_str = print_str[:-5] + '\n'
-                with open(self.settings.log_file, 'a') as f:
-                    f.write(log_str)
+            print(print_str[:-5])
+            log_str = print_str[:-5] + '\n'
+            with open(self.settings.log_file, 'a') as f:
+                f.write(log_str)
 
     def _stats_new_epoch(self):
         # Record learning rate

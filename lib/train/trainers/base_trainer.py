@@ -89,18 +89,11 @@ class BaseTrainer:
                             self.lr_scheduler.step()
                         else:
                             self.lr_scheduler.step(epoch - 1)
-                    # Save at the experiment-configured interval and retain
-                    # the final epochs for recovery near training completion.
+                    # only save the last 10 checkpoints
                     save_every_epoch = getattr(self.settings, "save_every_epoch", False)
-                    checkpoint_interval = getattr(
-                        self.settings, "checkpoint_epoch_interval", 40
-                    )
-                    if (
-                        epoch == max_epochs
-                        or save_every_epoch
-                        or epoch % checkpoint_interval == 0
-                        or epoch > (max_epochs - 5)
-                    ):
+                    save_epochs = [79, 159, 239]
+                    if epoch > (max_epochs - 1) or save_every_epoch or epoch % 40 == 0 or epoch in save_epochs or epoch > (max_epochs - 5):
+                    # if epoch > (max_epochs - 10) or save_every_epoch or epoch % 100 == 0:
                         if self._checkpoint_dir:
                             if self.settings.local_rank in [-1, 0]:
                                 self.save_checkpoint()
