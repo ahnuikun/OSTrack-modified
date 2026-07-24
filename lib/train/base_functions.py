@@ -10,6 +10,9 @@ from lib.utils.misc import is_main_process
 
 def update_settings(settings, cfg):
     settings.print_interval = cfg.TRAIN.PRINT_INTERVAL
+    settings.checkpoint_epoch_interval = getattr(
+        cfg.TRAIN, "CHECKPOINT_EPOCH_INTERVAL", 40
+    )
     settings.search_area_factor = {'template': cfg.DATA.TEMPLATE.FACTOR,
                                    'search': cfg.DATA.SEARCH.FACTOR}
     settings.output_sz = {'template': cfg.DATA.TEMPLATE.SIZE,
