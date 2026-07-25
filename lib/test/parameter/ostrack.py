@@ -21,8 +21,10 @@ def parameters(yaml_name: str):
     params.search_size = cfg.TEST.SEARCH_SIZE
 
     # Network checkpoint path
+    checkpoint_config = cfg.TEST.CHECKPOINT_CONFIG or yaml_name
     params.checkpoint = os.path.join(save_dir, "checkpoints/train/ostrack/%s/OSTrack_ep%04d.pth.tar" %
-                                     (yaml_name, cfg.TEST.EPOCH))
+                                     (checkpoint_config, cfg.TEST.EPOCH))
+    params.vdrm_alpha_override = cfg.TEST.VDRM_ALPHA_OVERRIDE
 
     # whether to save boxes from all queries
     params.save_all_boxes = False

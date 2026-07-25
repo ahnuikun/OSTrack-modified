@@ -16,12 +16,40 @@ from lib.utils.box_ops import clip_box
 from lib.utils.ce_utils import generate_mask_cond
 
 
+def _apply_vdrm_alpha_override(network, alpha_override):
+    if alpha_override is None:
+        return None
+    if not hasattr(network.backbone, "vdrm"):
+        raise ValueError(
+            "TEST.VDRM_ALPHA_OVERRIDE requires an enabled VDRM backbone"
+        )
+    alpha_override = float(alpha_override)
+    if not math.isfinite(alpha_override):
+        raise ValueError(
+            "TEST.VDRM_ALPHA_OVERRIDE must be finite, "
+            f"got {alpha_override}"
+        )
+    checkpoint_alpha = network.backbone.vdrm.alpha.detach().item()
+    with torch.no_grad():
+        network.backbone.vdrm.alpha.fill_(alpha_override)
+    return checkpoint_alpha, network.backbone.vdrm.alpha.detach().item()
+
+
 class OSTrack(BaseTracker):
     def __init__(self, params, dataset_name):
         super(OSTrack, self).__init__(params)
         network = build_ostrack(params.cfg, training=False)
         checkpoint = torch.load(self.params.checkpoint, map_location='cpu', weights_only=False)
         network.load_state_dict(checkpoint['net'], strict=True)
+        alpha_override = getattr(self.params, "vdrm_alpha_override", None)
+        alpha_values = _apply_vdrm_alpha_override(network, alpha_override)
+        if alpha_values is not None:
+            checkpoint_alpha, runtime_alpha = alpha_values
+            print(
+                "VDRM inference alpha override: "
+                f"checkpoint={checkpoint_alpha:.8f}, "
+                f"runtime={runtime_alpha:.8f}"
+            )
         self.cfg = params.cfg
         self.network = network.cuda()
         self.network.eval()

@@ -114,6 +114,8 @@ cfg.TEST.TEMPLATE_SIZE = 128
 cfg.TEST.SEARCH_FACTOR = 5.0
 cfg.TEST.SEARCH_SIZE = 320
 cfg.TEST.EPOCH = 500
+cfg.TEST.CHECKPOINT_CONFIG = ""
+cfg.TEST.VDRM_ALPHA_OVERRIDE = None
 
 
 def _edict2dict(dest_dict, src_edict):
