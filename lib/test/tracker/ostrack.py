@@ -129,6 +129,17 @@ class OSTrack(BaseTracker):
         visual_reliability = out_dict.get('visual_reliability')
         if visual_reliability is not None:
             visual_reliability = visual_reliability.detach().mean().item()
+        part_reliability = out_dict.get('part_reliability')
+        if part_reliability is not None:
+            part_reliability = (
+                part_reliability.detach().mean(dim=0).cpu().tolist()
+            )
+        part_valid = out_dict.get('part_valid')
+        if part_valid is not None:
+            part_valid = part_valid.detach().all(dim=0).cpu().tolist()
+        vdrm_alpha = out_dict.get('vdrm_alpha')
+        if vdrm_alpha is not None:
+            vdrm_alpha = vdrm_alpha.detach().item()
         response = self.output_window * pred_score_map
         pred_boxes = self.network.box_head.cal_bbox(response, out_dict['size_map'], out_dict['offset_map'])
         pred_boxes = pred_boxes.view(-1, 4)
@@ -173,13 +184,19 @@ class OSTrack(BaseTracker):
                     "all_boxes": all_boxes_save,
                     "score": max_score,
                     "response_map": pred_score_map.detach(),
-                    "visual_reliability": visual_reliability}
+                    "visual_reliability": visual_reliability,
+                    "part_reliability": part_reliability,
+                    "part_valid": part_valid,
+                    "vdrm_alpha": vdrm_alpha}
         else:
             return {
                 "target_bbox": self.state,
                 "score": max_score,
                 "response_map": pred_score_map.detach(),
                 "visual_reliability": visual_reliability,
+                "part_reliability": part_reliability,
+                "part_valid": part_valid,
+                "vdrm_alpha": vdrm_alpha,
             }
 
     def map_box_back(self, pred_box: list, resize_factor: float):
