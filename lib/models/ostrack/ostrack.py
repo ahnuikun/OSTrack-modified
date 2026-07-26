@@ -135,6 +135,8 @@ def build_ostrack(cfg, training=True):
                                            vdrm_insert_layer=vdrm_cfg.INSERT_LAYER if vdrm_enabled else 6,
                                            vdrm_num_parts=vdrm_cfg.NUM_PARTS if vdrm_enabled else 4,
                                            vdrm_topk=vdrm_cfg.TOPK if vdrm_enabled else 4,
+                                           vdrm_reliability_mode=vdrm_cfg.RELIABILITY_MODE if vdrm_enabled else "topk",
+                                           vdrm_nms_radius=vdrm_cfg.NMS_RADIUS if vdrm_enabled else 1,
                                            vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                            vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                            )
@@ -151,6 +153,8 @@ def build_ostrack(cfg, training=True):
                                             vdrm_insert_layer=vdrm_cfg.INSERT_LAYER if vdrm_enabled else 6,
                                             vdrm_num_parts=vdrm_cfg.NUM_PARTS if vdrm_enabled else 4,
                                             vdrm_topk=vdrm_cfg.TOPK if vdrm_enabled else 4,
+                                            vdrm_reliability_mode=vdrm_cfg.RELIABILITY_MODE if vdrm_enabled else "topk",
+                                            vdrm_nms_radius=vdrm_cfg.NMS_RADIUS if vdrm_enabled else 1,
                                             vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                             vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                             )

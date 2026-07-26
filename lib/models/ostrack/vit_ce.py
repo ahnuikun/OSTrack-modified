@@ -35,7 +35,8 @@ class VisionTransformerCE(VisionTransformer):
                  act_layer=None, weight_init='',
                  ce_loc=None, ce_keep_ratio=None,
                  vdrm_enabled=False, vdrm_insert_layer=6, vdrm_num_parts=4,
-                 vdrm_topk=4, vdrm_initial_match_scale=5.0,
+                 vdrm_topk=4, vdrm_reliability_mode="topk",
+                 vdrm_nms_radius=1, vdrm_initial_match_scale=5.0,
                  vdrm_initial_match_bias=-2.5):
         """
         Args:
@@ -112,6 +113,8 @@ class VisionTransformerCE(VisionTransformer):
             self.vdrm = VisibilityDrivenRepresentationModule(
                 num_parts=vdrm_num_parts,
                 topk=vdrm_topk,
+                reliability_mode=vdrm_reliability_mode,
+                nms_radius=vdrm_nms_radius,
                 initial_match_scale=vdrm_initial_match_scale,
                 initial_match_bias=vdrm_initial_match_bias,
             )
@@ -181,6 +184,8 @@ class VisionTransformerCE(VisionTransformer):
                     x,
                     template_length=global_index_t.shape[1],
                     template_bbox=template_bbox,
+                    search_global_index=global_index_s,
+                    search_grid_size=int(math.sqrt(lens_x)),
                 )
 
         x = self.norm(x)

@@ -9,6 +9,108 @@ from ...utils.ce_utils import generate_mask_cond, adjust_keep_rate
 from ..data.vdrm_augmentation import apply_structured_target_occlusion
 
 
+def compute_vdrm_part_rank_loss(
+    part_similarity,
+    search_global_index,
+    gaussian_map,
+    part_valid=None,
+    part_weight=None,
+    margin=0.1,
+):
+    """Rank each template part's target match above background matches.
+
+    ``part_similarity`` is computed inside VDRM before the residual is added.
+    Candidate elimination may have removed search tokens, so
+    ``search_global_index`` maps the retained tokens back to the original
+    score-map grid used by ``gaussian_map``.
+    """
+    if part_similarity.ndim != 3:
+        raise ValueError(
+            "part_similarity must have shape [B, K, L], got "
+            f"{tuple(part_similarity.shape)}"
+        )
+    batch_size, num_parts, search_length = part_similarity.shape
+    if search_global_index.shape != (batch_size, search_length):
+        raise ValueError(
+            "search_global_index must have shape [B, L], got "
+            f"{tuple(search_global_index.shape)}"
+        )
+    if gaussian_map.ndim != 3 or gaussian_map.shape[0] != batch_size:
+        raise ValueError(
+            "gaussian_map must have shape [B, H, W], got "
+            f"{tuple(gaussian_map.shape)}"
+        )
+
+    global_index = search_global_index.to(
+        device=part_similarity.device, dtype=torch.long
+    )
+    flat_gaussian = gaussian_map.to(
+        device=part_similarity.device, dtype=part_similarity.dtype
+    ).flatten(1)
+    if (
+        global_index.numel() == 0
+        or global_index.min() < 0
+        or global_index.max() >= flat_gaussian.shape[1]
+    ):
+        raise ValueError("search_global_index is outside gaussian_map")
+
+    retained_gaussian = flat_gaussian.gather(1, global_index)
+    positive_mask = retained_gaussian > 0.0
+
+    # With aggressive candidate elimination the Gaussian support can be
+    # removed. Use the retained token nearest to the target peak as a stable
+    # fallback instead of dropping the whole sample.
+    missing_positive = ~positive_mask.any(dim=1)
+    if missing_positive.any():
+        full_peak_index = flat_gaussian.argmax(dim=1)
+        grid_width = gaussian_map.shape[2]
+        token_x = global_index.remainder(grid_width)
+        token_y = global_index.div(grid_width, rounding_mode="floor")
+        peak_x = full_peak_index.remainder(grid_width).unsqueeze(1)
+        peak_y = full_peak_index.div(
+            grid_width, rounding_mode="floor"
+        ).unsqueeze(1)
+        squared_distance = (token_x - peak_x).square() + (
+            token_y - peak_y
+        ).square()
+        fallback_index = squared_distance.argmin(dim=1, keepdim=True)
+        fallback_mask = torch.zeros_like(positive_mask)
+        fallback_mask.scatter_(1, fallback_index, True)
+        positive_mask = positive_mask | (
+            missing_positive.unsqueeze(1) & fallback_mask
+        )
+
+    negative_mask = (retained_gaussian <= 0.0) & ~positive_mask
+    positive_similarity = part_similarity.masked_fill(
+        ~positive_mask[:, None, :], -torch.inf
+    ).amax(dim=-1)
+    negative_similarity = part_similarity.masked_fill(
+        ~negative_mask[:, None, :], -torch.inf
+    ).amax(dim=-1)
+
+    valid = negative_mask.any(dim=1, keepdim=True).expand(
+        batch_size, num_parts
+    )
+    if part_valid is not None:
+        valid = valid & part_valid.to(device=valid.device, dtype=torch.bool)
+
+    element_loss = F.softplus(
+        float(margin) + negative_similarity - positive_similarity
+    )
+    loss_weight = valid.to(element_loss.dtype)
+    if part_weight is not None:
+        if part_weight.shape != (batch_size, num_parts):
+            raise ValueError(
+                "part_weight must have shape [B, K], got "
+                f"{tuple(part_weight.shape)}"
+            )
+        loss_weight = loss_weight * part_weight.to(
+            device=element_loss.device, dtype=element_loss.dtype
+        ).clamp(0.0, 1.0)
+
+    return (element_loss * loss_weight).sum() / loss_weight.sum().clamp_min(1.0)
+
+
 class OSTrackActor(BaseActor):
     """ Actor for training OSTrack models """
 
@@ -159,7 +261,31 @@ class OSTrackActor(BaseActor):
                     visibility_element * visibility_mask_float
                 ).sum() / visibility_mask_float.sum().clamp_min(1.0)
 
-            if 'score_logits' in pred_dict:
+            reliability_mode = getattr(vdrm_cfg, 'RELIABILITY_MODE', 'topk')
+            if reliability_mode == 'margin':
+                required_rank_outputs = {
+                    'part_similarity', 'search_global_index'
+                }
+                missing_rank_outputs = required_rank_outputs.difference(
+                    pred_dict
+                )
+                if missing_rank_outputs:
+                    raise RuntimeError(
+                        "VDRM margin rank loss is missing model outputs: "
+                        f"{sorted(missing_rank_outputs)}"
+                    )
+                part_weight = pred_dict.get('vdrm_visibility_target')
+                rank_loss = compute_vdrm_part_rank_loss(
+                    pred_dict['part_similarity'],
+                    pred_dict['search_global_index'],
+                    gt_gaussian_maps.squeeze(1),
+                    part_valid=pred_dict.get('part_valid'),
+                    part_weight=part_weight,
+                    margin=getattr(
+                        self.cfg.TRAIN, 'VDRM_RANK_MARGIN', 0.1
+                    ),
+                )
+            elif 'score_logits' in pred_dict:
                 score_logits = pred_dict['score_logits'].squeeze(1)
                 gaussian_map = gt_gaussian_maps.squeeze(1)
                 positive_index = gaussian_map.flatten(1).argmax(
@@ -214,6 +340,18 @@ class OSTrackActor(BaseActor):
                     "VDRM/reliability": pred_dict['visual_reliability'].detach().mean().item()
                     if 'visual_reliability' in pred_dict else 0.0,
                 })
+                if 'part_match_margin' in pred_dict:
+                    status.update({
+                        "VDRM/match_margin": pred_dict[
+                            'part_match_margin'
+                        ].detach().mean().item(),
+                        "VDRM/peak_similarity": pred_dict[
+                            'part_peak_similarity'
+                        ].detach().mean().item(),
+                        "VDRM/hard_negative_similarity": pred_dict[
+                            'part_hard_negative_similarity'
+                        ].detach().mean().item(),
+                    })
             return loss, status
         else:
             return loss

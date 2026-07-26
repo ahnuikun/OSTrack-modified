@@ -255,7 +255,13 @@ def summarize_rows(rows):
         key
         for row in rows
         for key in row
-        if key.startswith("part_") and key.endswith("_reliability")
+        if key.startswith("part_")
+        and key.endswith((
+            "_reliability",
+            "_peak_similarity",
+            "_hard_negative_similarity",
+            "_match_margin",
+        ))
     })
     reliability_metrics = [
         "visual_reliability",
@@ -355,6 +361,24 @@ def _diagnostic_row(frame_index, frame_path, ground_truth, tracker_output, elaps
     ):
         row[f"part_{index}_reliability"] = reliability
         row[f"part_{index}_valid"] = bool(valid)
+
+    optional_part_metrics = {
+        "peak_similarity": tracker_output.get("part_peak_similarity"),
+        "hard_negative_similarity": tracker_output.get(
+            "part_hard_negative_similarity"
+        ),
+        "match_margin": tracker_output.get("part_match_margin"),
+    }
+    for metric_name, values in optional_part_metrics.items():
+        if values is None:
+            continue
+        if len(values) != len(part_reliability):
+            raise RuntimeError(
+                f"VDRM {metric_name} has {len(values)} parts, expected "
+                f"{len(part_reliability)}"
+            )
+        for index, value in enumerate(values):
+            row[f"part_{index}_{metric_name}"] = value
 
     row.update(
         response_statistics(tracker_output["response_map"], nms_radius)

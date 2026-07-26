@@ -35,6 +35,8 @@ cfg.MODEL.VDRM.ENABLED = False
 cfg.MODEL.VDRM.INSERT_LAYER = 6  # one-based block number; applied after this block
 cfg.MODEL.VDRM.NUM_PARTS = 4
 cfg.MODEL.VDRM.TOPK = 4
+cfg.MODEL.VDRM.RELIABILITY_MODE = "topk"
+cfg.MODEL.VDRM.NMS_RADIUS = 1
 cfg.MODEL.VDRM.INITIAL_MATCH_SCALE = 5.0
 cfg.MODEL.VDRM.INITIAL_MATCH_BIAS = -2.5
 
@@ -66,6 +68,7 @@ cfg.TRAIN.CE_WARM_EPOCH = 80  # candidate elimination warm up epoch
 cfg.TRAIN.DROP_PATH_RATE = 0.1  # drop path rate for ViT backbone
 cfg.TRAIN.VDRM_VISIBILITY_WEIGHT = 0.5
 cfg.TRAIN.VDRM_RANK_WEIGHT = 0.5
+cfg.TRAIN.VDRM_RANK_MARGIN = 0.1
 cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS = 20
 
 # TRAIN.SCHEDULER

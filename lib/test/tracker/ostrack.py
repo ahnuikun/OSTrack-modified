@@ -137,6 +137,23 @@ class OSTrack(BaseTracker):
         part_valid = out_dict.get('part_valid')
         if part_valid is not None:
             part_valid = part_valid.detach().all(dim=0).cpu().tolist()
+        part_peak_similarity = out_dict.get('part_peak_similarity')
+        if part_peak_similarity is not None:
+            part_peak_similarity = (
+                part_peak_similarity.detach().mean(dim=0).cpu().tolist()
+            )
+        part_hard_negative_similarity = out_dict.get(
+            'part_hard_negative_similarity'
+        )
+        if part_hard_negative_similarity is not None:
+            part_hard_negative_similarity = (
+                part_hard_negative_similarity.detach().mean(dim=0).cpu().tolist()
+            )
+        part_match_margin = out_dict.get('part_match_margin')
+        if part_match_margin is not None:
+            part_match_margin = (
+                part_match_margin.detach().mean(dim=0).cpu().tolist()
+            )
         vdrm_alpha = out_dict.get('vdrm_alpha')
         if vdrm_alpha is not None:
             vdrm_alpha = vdrm_alpha.detach().item()
@@ -187,6 +204,9 @@ class OSTrack(BaseTracker):
                     "visual_reliability": visual_reliability,
                     "part_reliability": part_reliability,
                     "part_valid": part_valid,
+                    "part_peak_similarity": part_peak_similarity,
+                    "part_hard_negative_similarity": part_hard_negative_similarity,
+                    "part_match_margin": part_match_margin,
                     "vdrm_alpha": vdrm_alpha}
         else:
             return {
@@ -196,6 +216,9 @@ class OSTrack(BaseTracker):
                 "visual_reliability": visual_reliability,
                 "part_reliability": part_reliability,
                 "part_valid": part_valid,
+                "part_peak_similarity": part_peak_similarity,
+                "part_hard_negative_similarity": part_hard_negative_similarity,
+                "part_match_margin": part_match_margin,
                 "vdrm_alpha": vdrm_alpha,
             }
 

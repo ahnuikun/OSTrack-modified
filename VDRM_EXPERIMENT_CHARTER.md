@@ -235,6 +235,45 @@ F'=F+\alpha F_{\mathrm{VDRM}},
 
 同类目标 Copy-Paste 仅保留为核心 VDRM 跑通后的独立训练增强消融，不属于第一版实现门禁。
 
+### 4.5 第二版 VDRM-v2 注册设计
+
+VDRM-v1 完整训练与四序列逐帧诊断表明，第一版绝对 Top-4 相似度可靠性不能稳定区分“目标身份匹配正确”和“搜索区中存在模板相似内容”。第二版只修正可靠性证据及其排序监督，不改部件原型、残差路径、插入位置、主损失或训练协议。
+
+1. 继续使用模板目标局部 `2×2` 四部件、Masked Mean 原型和余弦相似度图。
+2. 对每个部件找到搜索相似度第一峰；在原始 `16×16` 搜索 token 坐标系中抑制第一峰周围半径 1 的方形邻域，再选择空间上不同的最强峰作为硬干扰。
+3. 部件可靠性证据改为非负匹配间隔：
+
+\[
+m_k=\max\left(0,s^+_k-s^-_k\right)
+\]
+
+4. 可靠性仍只使用共享标量仿射和 Sigmoid：
+
+\[
+q_k=\sigma\left(\operatorname{softplus}(a)m_k+b\right)
+\]
+
+不增加 MLP、质量预测头或额外门控。V2 初始化使用 `scale=5.0, bias=0.0`；偏置可通过可见性监督学习到低于 0.5 的遮挡可靠性。
+5. `L_rank` 直接监督 VDRM 内部的部件—搜索 token 相似度图，而不是最终 Center Head 响应。GT Gaussian 支持区域内最高相似度为正样本，区域外最高相似度为硬负样本：
+
+\[
+\mathcal L_{\mathrm{rank}}
+=
+\operatorname{softplus}
+\left(0.1+s^-_k-s^+_k\right)
+\]
+
+6. 若 CE 已删除 GT Gaussian 支持区的全部 token，则以当前保留 token 中距离 GT 中心最近者作为正样本，避免样本被静默丢弃。
+7. 结构化遮挡样本的排序损失按部件可见比例加权，避免强迫完全遮挡部件匹配目标；普通样本权重为 1。
+8. 继续使用单个零初始化 `alpha` 和原残差重构公式，不修改残差方向、强度或注入位置。
+9. V1 的 `topk` 分支完整保留，旧配置与旧 checkpoint 可继续复现；V2 使用独立配置和独立输出目录。
+
+第二版配置：
+
+```text
+experiments/ostrack/vitb_256_mae_ce_vdrm_v2_32x4_ep300.yaml
+```
+
 ## 5. 统一 Tracker 接口
 
 VDRM Tracker 必须提供以下逻辑输出：
@@ -530,6 +569,16 @@ conclusion
 **主线判断规则：** 如果一项改动不能直接服务于“可见性引导的部件表征”或“真实目标与硬干扰的判别学习”，则它不属于 VDRM 主线；若它涉及相机、轨迹、速度、搜索中心或框融合，则应放入 CTMP 项目。
 
 **仓库上传规则：** 上传源码、配置、实验章程和测试脚本；不上传根目录 `data/`、`output/`、`pretrained_models/`、checkpoint、结果文件或模型权重。`lib/train/data/` 是源码目录，必须上传，不能用未锚定的 `data/` 忽略规则误排除。
+
+## Change-20260726-01
+
+- Proposed change: 将 VDRM-v1 的绝对 Top-4 相似度可靠性改为第一峰与空间去重后最强干扰峰的 margin；将 `L_rank` 从 Center Head 响应改为直接监督同一部件相似度图。
+- Reason: V1 的可靠性衡量“是否存在模板相似内容”，无法可靠判断跟踪器选择的是否仍为原目标身份。
+- Evidence: `uav_car15` 首次持续失败时 IoU 降至 0.083，但 VDRM 可靠性从失败前约 0.666 上升至约 0.706；`uav_car7` 在第 271 帧锁定错误同类目标时 VDRM 可靠性约 0.790、响应可靠性约 0.578，并持续失败到第 720 帧，而恢复正确时 VDRM 可靠性仅约 0.653。`uav_car12` 说明低置信度可检测部分遮挡失败，但不能解决上述同类身份混淆。
+- Affected experiments: 新增 VDRM-v2 独立训练；V1 代码路径、配置和已有结果保留。
+- Does it change a locked item: no。四数据集、比例、60000 samples/epoch、300 epoch、epoch 240 降学习率、CE 位置、Block 6 插入、损失权重、warm-up 和残差结构均不变。
+- Required new baseline or ablation: 同协议比较重训 OSTrack、VDRM-v1、VDRM-v2；首先观察四个已登记 UAV123 序列，再统一测试五个数据集。不得依据单个测试集为 V2 设置专用阈值。
+- Decision: approved。用户于 2026-07-26 授权开始修改和优化；仅实施可靠性与排序监督改动。
 
 ## 13. 第一版实现状态与执行入口
 

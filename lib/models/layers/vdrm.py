@@ -8,6 +8,10 @@ The first implementation intentionally keeps the design small:
 * matched, reliable prototypes are added to search tokens through one
   zero-initialized residual scalar.
 
+The original ``topk`` reliability is retained for VDRM-v1 checkpoint
+compatibility. VDRM-v2 uses the margin between a part's best match and its
+strongest spatially distinct match.
+
 No temporal state or motion information is used here.
 """
 
@@ -28,6 +32,8 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         self,
         num_parts: int = 4,
         topk: int = 4,
+        reliability_mode: str = "topk",
+        nms_radius: int = 1,
         initial_match_scale: float = 5.0,
         initial_match_bias: float = -2.5,
         eps: float = 1e-6,
@@ -38,10 +44,21 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             raise ValueError(f"num_parts must be a square number, got {num_parts}")
         if topk < 1:
             raise ValueError(f"topk must be positive, got {topk}")
+        if reliability_mode not in ("topk", "margin"):
+            raise ValueError(
+                "reliability_mode must be 'topk' or 'margin', "
+                f"got {reliability_mode!r}"
+            )
+        if nms_radius < 0:
+            raise ValueError(
+                f"nms_radius must be non-negative, got {nms_radius}"
+            )
 
         self.num_parts = num_parts
         self.part_grid = part_grid
         self.topk = topk
+        self.reliability_mode = reliability_mode
+        self.nms_radius = nms_radius
         self.eps = eps
 
         # A shared monotonic calibration is enough for the first version.
@@ -55,6 +72,73 @@ class VisibilityDrivenRepresentationModule(nn.Module):
 
         # Zero initialization preserves the original OSTrack forward path.
         self.alpha = nn.Parameter(torch.zeros(()))
+
+    def _margin_statistics(
+        self,
+        similarity: torch.Tensor,
+        search_global_index: torch.Tensor,
+        search_grid_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the first peak, spatially distinct hard peak, and margin."""
+        if search_grid_size < 1:
+            raise ValueError(
+                f"search_grid_size must be positive, got {search_grid_size}"
+            )
+        if search_global_index.shape != (
+            similarity.shape[0], similarity.shape[2]
+        ):
+            raise ValueError(
+                "search_global_index must have shape [B, L_s], got "
+                f"{tuple(search_global_index.shape)} for similarity "
+                f"{tuple(similarity.shape)}"
+            )
+
+        global_index = search_global_index.to(
+            device=similarity.device, dtype=torch.long
+        )
+        if (
+            global_index.numel() == 0
+            or global_index.min() < 0
+            or global_index.max() >= search_grid_size ** 2
+        ):
+            raise ValueError(
+                "search_global_index contains values outside the original "
+                f"{search_grid_size}x{search_grid_size} search grid"
+            )
+
+        peak_similarity, peak_local_index = similarity.max(dim=-1)
+        expanded_global_index = global_index[:, None, :].expand(
+            -1, similarity.shape[1], -1
+        )
+        peak_global_index = expanded_global_index.gather(
+            dim=2, index=peak_local_index.unsqueeze(-1)
+        ).squeeze(-1)
+
+        token_x = global_index.remainder(search_grid_size)[:, None, :]
+        token_y = global_index.div(
+            search_grid_size, rounding_mode="floor"
+        )[:, None, :]
+        peak_x = peak_global_index.remainder(search_grid_size).unsqueeze(-1)
+        peak_y = peak_global_index.div(
+            search_grid_size, rounding_mode="floor"
+        ).unsqueeze(-1)
+        same_peak_neighborhood = (
+            (token_x - peak_x).abs() <= self.nms_radius
+        ) & ((token_y - peak_y).abs() <= self.nms_radius)
+
+        hard_negative_similarity = similarity.masked_fill(
+            same_peak_neighborhood, -torch.inf
+        ).amax(dim=-1)
+        has_hard_negative = (~same_peak_neighborhood).any(dim=-1)
+        hard_negative_similarity = torch.where(
+            has_hard_negative,
+            hard_negative_similarity,
+            peak_similarity,
+        )
+        match_margin = (peak_similarity - hard_negative_similarity).clamp_min(
+            0.0
+        )
+        return peak_similarity, hard_negative_similarity, match_margin
 
     def _default_template_bbox(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -123,6 +207,8 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         tokens: torch.Tensor,
         template_length: int,
         template_bbox: Optional[torch.Tensor] = None,
+        search_global_index: Optional[torch.Tensor] = None,
+        search_grid_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Refine search tokens and return reliability diagnostics.
 
@@ -166,11 +252,36 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "bkc,blc->bkl", normalized_prototypes, normalized_search
         )
 
-        match_topk = min(self.topk, search_tokens.shape[1])
-        top_similarity = similarity.topk(match_topk, dim=-1).values.mean(dim=-1)
+        margin_diagnostics = {}
+        if self.reliability_mode == "topk":
+            match_topk = min(self.topk, search_tokens.shape[1])
+            reliability_evidence = similarity.topk(
+                match_topk, dim=-1
+            ).values.mean(dim=-1)
+        else:
+            if search_global_index is None or search_grid_size is None:
+                raise ValueError(
+                    "margin reliability requires search_global_index and "
+                    "search_grid_size"
+                )
+            peak_similarity, hard_negative_similarity, match_margin = (
+                self._margin_statistics(
+                    similarity,
+                    search_global_index,
+                    int(search_grid_size),
+                )
+            )
+            reliability_evidence = match_margin
+            margin_diagnostics = {
+                "part_peak_similarity": peak_similarity,
+                "part_hard_negative_similarity": hard_negative_similarity,
+                "part_match_margin": match_margin,
+                "part_similarity": similarity,
+                "search_global_index": search_global_index,
+            }
         match_scale = F.softplus(self.log_match_scale)
         part_reliability = torch.sigmoid(
-            match_scale * top_similarity + self.match_bias
+            match_scale * reliability_evidence + self.match_bias
         )
         part_reliability = (
             part_reliability * part_valid.to(part_reliability.dtype)
@@ -206,4 +317,5 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "visual_reliability": visual_reliability,
             "vdrm_alpha": self.alpha,
         }
+        diagnostics.update(margin_diagnostics)
         return output_tokens, diagnostics
