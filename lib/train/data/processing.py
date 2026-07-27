@@ -3,6 +3,9 @@ import torchvision.transforms as transforms
 from lib.utils import TensorDict
 import lib.train.data.processing_utils as prutils
 import torch.nn.functional as F
+from lib.train.data.vdrm_augmentation import (
+    apply_same_class_distractor_copy_paste,
+)
 
 
 def stack_tensors(x):
@@ -46,7 +49,10 @@ class STARKProcessing(BaseProcessing):
     """
 
     def __init__(self, search_area_factor, output_sz, center_jitter_factor, scale_jitter_factor,
-                 mode='pair', settings=None, *args, **kwargs):
+                 mode='pair', settings=None,
+                 same_class_distractor_min_scale=0.7,
+                 same_class_distractor_max_scale=1.3,
+                 *args, **kwargs):
         """
         args:
             search_area_factor - The size of the search region  relative to the target size.
@@ -65,6 +71,18 @@ class STARKProcessing(BaseProcessing):
         self.scale_jitter_factor = scale_jitter_factor
         self.mode = mode
         self.settings = settings
+        if not 0.0 < same_class_distractor_min_scale <= same_class_distractor_max_scale:
+            raise ValueError(
+                "same-class distractor scales must satisfy 0 < min <= max, "
+                f"got {same_class_distractor_min_scale}, "
+                f"{same_class_distractor_max_scale}"
+            )
+        self.same_class_distractor_min_scale = (
+            same_class_distractor_min_scale
+        )
+        self.same_class_distractor_max_scale = (
+            same_class_distractor_max_scale
+        )
 
     def _get_jittered_box(self, box, mode):
         """ Jitter the input box
@@ -91,12 +109,29 @@ class STARKProcessing(BaseProcessing):
             TensorDict - output data block with following fields:
                 'template_images', 'search_images', 'template_anno', 'search_anno', 'test_proposals', 'proposal_iou'
         """
+        distractor_images = data.pop("vdrm_distractor_images", None)
+        distractor_anno = data.pop("vdrm_distractor_anno", None)
+        distractor_masks = data.pop("vdrm_distractor_masks", None)
+        has_distractor = all(
+            item is not None
+            for item in (distractor_images, distractor_anno, distractor_masks)
+        )
+
         # Apply joint transforms
         if self.transform['joint'] is not None:
             data['template_images'], data['template_anno'], data['template_masks'] = self.transform['joint'](
                 image=data['template_images'], bbox=data['template_anno'], mask=data['template_masks'])
             data['search_images'], data['search_anno'], data['search_masks'] = self.transform['joint'](
                 image=data['search_images'], bbox=data['search_anno'], mask=data['search_masks'], new_roll=False)
+            if has_distractor:
+                distractor_images, distractor_anno, distractor_masks = (
+                    self.transform['joint'](
+                        image=distractor_images,
+                        bbox=distractor_anno,
+                        mask=distractor_masks,
+                        new_roll=False,
+                    )
+                )
 
         for s in ['template', 'search']:
             assert self.mode == 'sequence' or len(data[s + '_images']) == 1, \
@@ -140,6 +175,46 @@ class STARKProcessing(BaseProcessing):
                     #       "Replace it with new data.")
                     return data
 
+        distractor_applied = False
+        if has_distractor:
+            distractor_crops, distractor_boxes, distractor_att, distractor_mask_crops = (
+                prutils.jittered_center_crop(
+                    distractor_images,
+                    distractor_anno,
+                    distractor_anno,
+                    search_area_factor=2.0,
+                    output_sz=self.output_sz["search"],
+                    masks=distractor_masks,
+                )
+            )
+            (
+                transformed_distractor,
+                transformed_distractor_box,
+                transformed_distractor_att,
+                _,
+            ) = self.transform["search"](
+                image=distractor_crops,
+                bbox=distractor_boxes,
+                att=distractor_att,
+                mask=distractor_mask_crops,
+                joint=False,
+            )
+            if not transformed_distractor_att[0].all():
+                data["search_images"][0], distractor_applied = (
+                    apply_same_class_distractor_copy_paste(
+                        data["search_images"][0],
+                        data["search_anno"][0],
+                        transformed_distractor[0],
+                        transformed_distractor_box[0],
+                        min_scale=self.same_class_distractor_min_scale,
+                        max_scale=self.same_class_distractor_max_scale,
+                        invalid_mask=data["search_att"][0],
+                    )
+                )
+
+        data["vdrm_distractor_applied"] = torch.tensor(
+            [float(distractor_applied)], dtype=torch.float32
+        )
         data['valid'] = True
         # if we use copy-and-paste augmentation
         if data["template_masks"] is None or data["search_masks"] is None:

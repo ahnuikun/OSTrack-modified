@@ -22,7 +22,8 @@ class TrackingSampler(torch.utils.data.Dataset):
 
     def __init__(self, datasets, p_datasets, samples_per_epoch, max_gap,
                  num_search_frames, num_template_frames=1, processing=no_processing, frame_sample_mode='causal',
-                 train_cls=False, pos_prob=0.5):
+                 train_cls=False, pos_prob=0.5,
+                 same_class_distractor_probability=0.0):
         """
         args:
             datasets - List of datasets to be used for training
@@ -34,6 +35,9 @@ class TrackingSampler(torch.utils.data.Dataset):
             processing - An instance of Processing class which performs the necessary processing of the data.
             frame_sample_mode - Either 'causal' or 'interval'. If 'causal', then the test frames are sampled in a causally,
                                 otherwise randomly within the interval.
+            same_class_distractor_probability - Probability of sampling a
+                different instance of the same semantic class for training-only
+                Copy-Paste. Zero keeps the original sampler behavior.
         """
         self.datasets = datasets
         self.train_cls = train_cls  # whether we are training classification
@@ -53,6 +57,14 @@ class TrackingSampler(torch.utils.data.Dataset):
         self.num_template_frames = num_template_frames
         self.processing = processing
         self.frame_sample_mode = frame_sample_mode
+        if not 0.0 <= same_class_distractor_probability <= 1.0:
+            raise ValueError(
+                "same_class_distractor_probability must be in [0, 1], got "
+                f"{same_class_distractor_probability}"
+            )
+        self.same_class_distractor_probability = (
+            same_class_distractor_probability
+        )
 
     def __len__(self):
         return self.samples_per_epoch
@@ -161,6 +173,13 @@ class TrackingSampler(torch.utils.data.Dataset):
                                    'search_masks': search_masks,
                                    'dataset': dataset.get_name(),
                                    'test_class': meta_obj_test.get('object_class_name')})
+                distractor = self._sample_same_class_distractor(
+                    dataset,
+                    seq_id,
+                    meta_obj_test.get('object_class_name'),
+                )
+                if distractor is not None:
+                    data.update(distractor)
                 # make data augmentation
                 data = self.processing(data)
 
@@ -170,6 +189,66 @@ class TrackingSampler(torch.utils.data.Dataset):
                 valid = False
 
         return data
+
+    def _sample_same_class_distractor(
+        self,
+        dataset,
+        source_seq_id,
+        class_name,
+    ):
+        """Sample one visible, different instance from the source class."""
+        if (
+            self.same_class_distractor_probability <= 0.0
+            or random.random() >= self.same_class_distractor_probability
+            or class_name in (None, "", "Unknown")
+            or not dataset.has_class_info()
+            or not hasattr(dataset, "get_sequences_in_class")
+        ):
+            return None
+
+        try:
+            candidate_ids = [
+                candidate_id
+                for candidate_id in dataset.get_sequences_in_class(class_name)
+                if candidate_id != source_seq_id
+            ]
+            if not candidate_ids:
+                return None
+
+            distractor_seq_id = random.choice(candidate_ids)
+            distractor_info = dataset.get_sequence_info(distractor_seq_id)
+            if dataset.is_video_sequence():
+                distractor_frame_ids = self._sample_visible_ids(
+                    distractor_info["visible"], num_ids=1
+                )
+                if distractor_frame_ids is None:
+                    return None
+            else:
+                distractor_frame_ids = [1]
+
+            distractor_frames, distractor_anno, distractor_meta = (
+                dataset.get_frames(
+                    distractor_seq_id,
+                    distractor_frame_ids,
+                    distractor_info,
+                )
+            )
+            if distractor_meta.get("object_class_name") != class_name:
+                return None
+
+            height, width, _ = distractor_frames[0].shape
+            distractor_masks = distractor_anno.get(
+                "mask", [torch.zeros((height, width))]
+            )
+            return {
+                "vdrm_distractor_images": distractor_frames,
+                "vdrm_distractor_anno": distractor_anno["bbox"],
+                "vdrm_distractor_masks": distractor_masks,
+            }
+        except Exception:
+            # A missing optional class entry must not discard an otherwise
+            # valid OSTrack training pair.
+            return None
 
     def getitem_cls(self):
         # get data for classification

@@ -274,6 +274,26 @@ q_k=\sigma\left(\operatorname{softplus}(a)m_k+b\right)
 experiments/ostrack/vitb_256_mae_ce_vdrm_v2_32x4_ep300.yaml
 ```
 
+VDRM-v2 已在完整训练后判定失败，只保留用于复现实验，不作为后续版本起点。最终 checkpoint 中匹配尺度收缩至约 `0.000169`、偏置约为 `0.619`，使可靠性几乎固定在 `0.65`；同时 `alpha` 下降至约 `-2.443`。五个统一测试集均未形成相对重训 OSTrack 的稳定收益。
+
+### 4.6 第三版 VDRM-v3-HNCP 注册设计
+
+VDRM-v3 回退到 VDRM-v1，只加入一项训练策略改动：真实同类硬干扰 Copy-Paste（Hard-Negative Copy-Paste, HNCP）。
+
+1. 网络结构、Top-4 可靠性、残差公式、`alpha`、插入位置和 V1 的 Center Head `L_rank` 全部保持不变。
+2. 从当前训练样本所属数据集的类别索引中，采样不同序列/实例的同语义类别可见目标；不跨数据集伪造类别映射。
+3. 使用真实标注框裁出该实例，在搜索图中目标框外粘贴；粘贴区域不得覆盖真实目标或 padding，真实目标框和全部监督标签保持不变。
+4. 训练样本采样概率固定为 `0.3`，干扰实例面积尺度相对真实目标使用 `[0.7, 1.3]`。类别未知或不存在另一实例时直接跳过，不用随机异类目标回退。
+5. 已有 V1 `L_rank` 继续从最终 Center Head 响应图中选择最高错误响应，因此会自然监督新增干扰；不新增 loss、margin、门控、质量头或可学习参数。
+6. 增强只在训练 dataloader 启用，验证、测试和 Tracker 接口完全不变。
+7. 日志只增加 `VDRM/distractor_applied_rate`，用于确认真实应用率；该统计不参与前向或损失。
+
+第三版配置：
+
+```text
+experiments/ostrack/vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300.yaml
+```
+
 ## 5. 统一 Tracker 接口
 
 VDRM Tracker 必须提供以下逻辑输出：
@@ -580,6 +600,16 @@ conclusion
 - Required new baseline or ablation: 同协议比较重训 OSTrack、VDRM-v1、VDRM-v2；首先观察四个已登记 UAV123 序列，再统一测试五个数据集。不得依据单个测试集为 V2 设置专用阈值。
 - Decision: approved。用户于 2026-07-26 授权开始修改和优化；仅实施可靠性与排序监督改动。
 
+## Change-20260727-01
+
+- Proposed change: 放弃 VDRM-v2，回退到 VDRM-v1；只增加训练期真实同类硬干扰 Copy-Paste。
+- Reason: V2 的 margin 标定在训练中塌缩为近常数可靠性，并通过极低匹配尺度绕开了预期判别目标；继续修改 margin 或增加门控会扩大不可归因因素。
+- Evidence: V2 最终 `alpha=-2.443376`、`scale=0.000169`、`bias=0.619119`，四个诊断序列的可靠性约固定为 `0.65`。在 `uav_car7` 第 271 帧错误锁定同类目标时，V2 仍给出接近最大匹配间隔，说明内部第一/第二峰 margin 不能识别目标身份。V2 相对重训 OSTrack 的 AUC 在 VisDrone、UAV123、UAVDT、DTB70、LaSOT 分别为 `-0.21/-1.31/-0.84/-0.07/-0.95`。
+- Affected experiments: 新增 VDRM-v3-HNCP 独立训练；V1、V2 配置和结果只作复现与对照。
+- Does it change a locked item: no。四训练数据集、比例、训练轮数、学习率、CE、VDRM 网络、残差、损失和 warm-up 均不变；只启用章程中预留的同类 Copy-Paste 训练增强。
+- Required new baseline or ablation: 使用同一重训 OSTrack 和 VDRM-v1 对照 VDRM-v3-HNCP；先检查应用率及四个登记序列，再统一测试五个数据集。不得同时修改可靠性、残差或损失。
+- Decision: approved。用户于 2026-07-27 明确要求下一版从 V1 回退并只做一个受控改动，禁止继续堆叠 margin、门控或额外质量头。
+
 ## 13. 第一版实现状态与执行入口
 
 截至第一版实现，已完成：
@@ -629,3 +659,50 @@ git check-ignore -v lib/train/data/processing.py
 ```
 
 预期前三个根目录被忽略，而 `lib/train/data/processing.py` 和 `lib/train/data/vdrm_augmentation.py` 不应被忽略。
+
+## 14. VDRM-v3-HNCP 实现状态与执行入口
+
+VDRM-v3-HNCP 只增加训练期真实同类干扰数据增强：
+
+- V1 与 V3 的 `MODEL`、`TRAIN` 配置及同随机种子初始化参数已验证完全一致；
+- 同类实例必须来自同一训练数据集的类别索引且不是当前实例；
+- 粘贴失败、类别未知或无另一实例时安全跳过；
+- 真实目标区域与标注不被覆盖；
+- 验证集和推理不采样、不粘贴干扰；
+- 不新增可学习参数、margin、loss、门控或质量头。
+
+本机已执行单元测试、真实 COCO 样本链路、batch collate、CPU smoke 和单张 RTX 5070 smoke。真实训练数据路径仍以服务器现有配置为准，本机检查未改写任何路径。
+
+服务器运行顺序：
+
+```bash
+python -m unittest discover -s tests -v
+
+CUDA_VISIBLE_DEVICES=0 \
+python tracking/smoke_test_vdrm.py \
+  --config experiments/ostrack/vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300.yaml \
+  --device cuda
+
+python tracking/smoke_test_vdrm_data.py \
+  --config vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300 \
+  --batches 4 \
+  --batch-size 8 \
+  --workers 2 \
+  --use-lmdb 0
+```
+
+上述三项通过后，才启动完整训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+python tracking/train.py \
+  --script ostrack \
+  --config vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300 \
+  --save_dir ./output \
+  --mode multiple \
+  --nproc_per_node 4 \
+  --use_lmdb 0 \
+  --use_wandb 0
+```
+
+训练日志中检查 `VDRM/distractor_applied_rate` 是否长期大于 0 且大致围绕配置概率波动。该统计只验证数据增强确实生效，不能单独作为效果结论。

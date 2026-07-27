@@ -340,6 +340,14 @@ class OSTrackActor(BaseActor):
                     "VDRM/reliability": pred_dict['visual_reliability'].detach().mean().item()
                     if 'visual_reliability' in pred_dict else 0.0,
                 })
+                if "vdrm_distractor_applied" in gt_dict:
+                    status["VDRM/distractor_applied_rate"] = (
+                        gt_dict["vdrm_distractor_applied"]
+                        .detach()
+                        .float()
+                        .mean()
+                        .item()
+                    )
                 if 'part_match_margin' in pred_dict:
                     status.update({
                         "VDRM/match_margin": pred_dict[

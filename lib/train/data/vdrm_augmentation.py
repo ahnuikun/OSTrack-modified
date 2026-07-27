@@ -1,10 +1,181 @@
-"""Training-only structured target occlusion for VDRM."""
+"""Training-only augmentations used by VDRM experiments."""
 
 from __future__ import annotations
 
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
+
+
+def _normalized_box_bounds(
+    box: torch.Tensor,
+    height: int,
+    width: int,
+) -> Tuple[int, int, int, int]:
+    """Convert one normalized ``xywh`` box to clipped integer bounds."""
+    box = box.detach().to(dtype=torch.float32).flatten()
+    if box.numel() != 4:
+        raise ValueError(f"box must contain four values, got {tuple(box.shape)}")
+
+    x0 = int(torch.floor(box[0].clamp(0.0, 1.0) * width).item())
+    y0 = int(torch.floor(box[1].clamp(0.0, 1.0) * height).item())
+    x1 = int(
+        torch.ceil((box[0] + box[2]).clamp(0.0, 1.0) * width).item()
+    )
+    y1 = int(
+        torch.ceil((box[1] + box[3]).clamp(0.0, 1.0) * height).item()
+    )
+    return x0, y0, x1, y1
+
+
+@torch.no_grad()
+def apply_same_class_distractor_copy_paste(
+    image: torch.Tensor,
+    target_box: torch.Tensor,
+    distractor_image: torch.Tensor,
+    distractor_box: torch.Tensor,
+    min_scale: float = 0.7,
+    max_scale: float = 1.3,
+    invalid_mask: torch.Tensor | None = None,
+    max_attempts: int = 24,
+) -> Tuple[torch.Tensor, bool]:
+    """Paste one real same-class instance outside the labelled target.
+
+    Both images are already transformed and normalized. The source is cropped
+    by its ground-truth box, resized relative to the labelled target area, and
+    pasted only where it does not overlap the target or padded search pixels.
+    The target box and all training labels remain unchanged.
+    """
+    if image.ndim != 3 or distractor_image.ndim != 3:
+        raise ValueError(
+            "image and distractor_image must have shape [C, H, W]"
+        )
+    if image.shape[0] != distractor_image.shape[0]:
+        raise ValueError("image and distractor_image channel counts must match")
+    if not 0.0 < min_scale <= max_scale:
+        raise ValueError(
+            "scales must satisfy 0 < min_scale <= max_scale, got "
+            f"{min_scale}, {max_scale}"
+        )
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be positive, got {max_attempts}")
+
+    _, height, width = image.shape
+    _, source_height, source_width = distractor_image.shape
+    target_x0, target_y0, target_x1, target_y1 = _normalized_box_bounds(
+        target_box, height, width
+    )
+    source_x0, source_y0, source_x1, source_y1 = _normalized_box_bounds(
+        distractor_box, source_height, source_width
+    )
+
+    target_width = target_x1 - target_x0
+    target_height = target_y1 - target_y0
+    source_width_box = source_x1 - source_x0
+    source_height_box = source_y1 - source_y0
+    if min(
+        target_width,
+        target_height,
+        source_width_box,
+        source_height_box,
+    ) < 2:
+        return image.clone(), False
+
+    source_patch = distractor_image[
+        :, source_y0:source_y1, source_x0:source_x1
+    ]
+    source_aspect = source_width_box / source_height_box
+    scale = torch.empty((), device=image.device).uniform_(
+        float(min_scale), float(max_scale)
+    ).item()
+    desired_area = target_width * target_height * scale * scale
+    paste_width = max(2, int(round((desired_area * source_aspect) ** 0.5)))
+    paste_height = max(2, int(round((desired_area / source_aspect) ** 0.5)))
+    if paste_width > width or paste_height > height:
+        return image.clone(), False
+
+    if invalid_mask is not None:
+        invalid_mask = invalid_mask.to(device=image.device, dtype=torch.bool)
+        if invalid_mask.shape != (height, width):
+            raise ValueError(
+                "invalid_mask must match the search image spatial size, got "
+                f"{tuple(invalid_mask.shape)} and {(height, width)}"
+            )
+
+    paste_x0 = paste_y0 = None
+    for _ in range(max_attempts):
+        candidate_x0 = int(
+            torch.randint(
+                0, width - paste_width + 1, (), device=image.device
+            ).item()
+        )
+        candidate_y0 = int(
+            torch.randint(
+                0, height - paste_height + 1, (), device=image.device
+            ).item()
+        )
+        candidate_x1 = candidate_x0 + paste_width
+        candidate_y1 = candidate_y0 + paste_height
+
+        overlaps_target = not (
+            candidate_x1 <= target_x0
+            or candidate_x0 >= target_x1
+            or candidate_y1 <= target_y0
+            or candidate_y0 >= target_y1
+        )
+        if overlaps_target:
+            continue
+        if (
+            invalid_mask is not None
+            and invalid_mask[
+                candidate_y0:candidate_y1, candidate_x0:candidate_x1
+            ].any()
+        ):
+            continue
+        paste_x0, paste_y0 = candidate_x0, candidate_y0
+        break
+
+    if paste_x0 is None or paste_y0 is None:
+        return image.clone(), False
+
+    resized_patch = F.interpolate(
+        source_patch.unsqueeze(0),
+        size=(paste_height, paste_width),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+
+    # A narrow feathered boundary avoids making a rectangular cut edge a
+    # shortcut while retaining the real annotated appearance of the instance.
+    alpha_y = image.new_ones(paste_height)
+    alpha_x = image.new_ones(paste_width)
+    edge = min(paste_height, paste_width) // 10
+    if edge > 0:
+        ramp = torch.linspace(
+            0.0,
+            1.0,
+            edge + 2,
+            device=image.device,
+            dtype=image.dtype,
+        )[1:-1]
+        alpha_y[:edge] = ramp
+        alpha_y[-edge:] = ramp.flip(0)
+        alpha_x[:edge] = ramp
+        alpha_x[-edge:] = ramp.flip(0)
+    alpha = (alpha_y[:, None] * alpha_x[None, :]).unsqueeze(0)
+
+    output = image.clone()
+    destination = output[
+        :,
+        paste_y0:paste_y0 + paste_height,
+        paste_x0:paste_x0 + paste_width,
+    ]
+    destination.copy_(
+        resized_patch.to(dtype=image.dtype) * alpha
+        + destination * (1.0 - alpha)
+    )
+    return output, True
 
 
 @torch.no_grad()

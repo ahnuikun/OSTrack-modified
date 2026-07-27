@@ -1,15 +1,41 @@
 import unittest
 
+import numpy as np
 import torch
 
 from lib.models.layers.vdrm import VisibilityDrivenRepresentationModule
 from lib.train.actors.ostrack import compute_vdrm_part_rank_loss
+from lib.train.data.sampler import TrackingSampler
 from lib.train.data.vdrm_augmentation import (
+    apply_same_class_distractor_copy_paste,
     apply_structured_target_occlusion,
 )
 
 
 class VDRMTest(unittest.TestCase):
+    class _FakeClassDataset:
+        def has_class_info(self):
+            return True
+
+        def get_sequences_in_class(self, class_name):
+            return [0, 1] if class_name == "car" else []
+
+        def is_video_sequence(self):
+            return True
+
+        def get_sequence_info(self, seq_id):
+            bbox = torch.tensor([[8.0, 8.0, 16.0, 16.0]]).repeat(20, 1)
+            visible = torch.ones(20, dtype=torch.uint8)
+            return {"bbox": bbox, "visible": visible, "valid": visible}
+
+        def get_frames(self, seq_id, frame_ids, anno=None):
+            frames = [
+                np.full((32, 32, 3), seq_id, dtype=np.uint8)
+                for _ in frame_ids
+            ]
+            boxes = [anno["bbox"][frame_id].clone() for frame_id in frame_ids]
+            return frames, {"bbox": boxes}, {"object_class_name": "car"}
+
     def test_zero_initialized_residual_preserves_tokens(self):
         torch.manual_seed(0)
         module = VisibilityDrivenRepresentationModule(
@@ -192,6 +218,52 @@ class VDRMTest(unittest.TestCase):
         self.assertTrue(torch.equal(unchanged, images))
         self.assertTrue((clean_visibility == 1.0).all())
         self.assertFalse(clean_applied.any())
+
+    def test_same_class_sampler_uses_a_different_instance(self):
+        sampler = TrackingSampler(
+            datasets=[],
+            p_datasets=[],
+            samples_per_epoch=1,
+            max_gap=10,
+            num_search_frames=1,
+            same_class_distractor_probability=1.0,
+        )
+        distractor = sampler._sample_same_class_distractor(
+            self._FakeClassDataset(),
+            source_seq_id=0,
+            class_name="car",
+        )
+
+        self.assertIsNotNone(distractor)
+        self.assertTrue((distractor["vdrm_distractor_images"][0] == 1).all())
+        self.assertIsNone(
+            sampler._sample_same_class_distractor(
+                self._FakeClassDataset(),
+                source_seq_id=0,
+                class_name="Unknown",
+            )
+        )
+
+    def test_same_class_copy_paste_preserves_target_pixels(self):
+        torch.manual_seed(7)
+        image = torch.zeros(3, 64, 64)
+        distractor = torch.ones(3, 64, 64)
+        target_box = torch.tensor([0.375, 0.375, 0.25, 0.25])
+        distractor_box = torch.tensor([0.25, 0.25, 0.50, 0.50])
+
+        augmented, applied = apply_same_class_distractor_copy_paste(
+            image,
+            target_box,
+            distractor,
+            distractor_box,
+            min_scale=1.0,
+            max_scale=1.0,
+            invalid_mask=torch.zeros(64, 64, dtype=torch.bool),
+        )
+
+        self.assertTrue(applied)
+        self.assertGreater(augmented.count_nonzero().item(), 0)
+        self.assertTrue(torch.equal(augmented[:, 24:40, 24:40], image[:, 24:40, 24:40]))
 
 
 if __name__ == "__main__":

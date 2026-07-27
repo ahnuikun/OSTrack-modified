@@ -109,7 +109,17 @@ def build_dataloaders(cfg, settings):
                                                        mode='sequence',
                                                        transform=transform_train,
                                                        joint_transform=transform_joint,
-                                                       settings=settings)
+                                                       settings=settings,
+                                                       same_class_distractor_min_scale=getattr(
+                                                           cfg.DATA.SEARCH,
+                                                           "VDRM_DISTRACTOR_MIN_SCALE",
+                                                           0.7,
+                                                       ),
+                                                       same_class_distractor_max_scale=getattr(
+                                                           cfg.DATA.SEARCH,
+                                                           "VDRM_DISTRACTOR_MAX_SCALE",
+                                                           1.3,
+                                                       ))
 
     data_processing_val = processing.STARKProcessing(search_area_factor=search_area_factor,
                                                      output_sz=output_sz,
@@ -131,7 +141,12 @@ def build_dataloaders(cfg, settings):
                                             samples_per_epoch=cfg.DATA.TRAIN.SAMPLE_PER_EPOCH,
                                             max_gap=cfg.DATA.MAX_SAMPLE_INTERVAL, num_search_frames=settings.num_search,
                                             num_template_frames=settings.num_template, processing=data_processing_train,
-                                            frame_sample_mode=sampler_mode, train_cls=train_cls)
+                                            frame_sample_mode=sampler_mode, train_cls=train_cls,
+                                            same_class_distractor_probability=getattr(
+                                                cfg.DATA.SEARCH,
+                                                "VDRM_DISTRACTOR_PROBABILITY",
+                                                0.0,
+                                            ))
 
     train_sampler = DistributedSampler(dataset_train) if settings.local_rank != -1 else None
     shuffle = False if settings.local_rank != -1 else True
