@@ -37,7 +37,8 @@ class VisionTransformerCE(VisionTransformer):
                  vdrm_enabled=False, vdrm_insert_layer=6, vdrm_num_parts=4,
                  vdrm_topk=4, vdrm_reliability_mode="topk",
                  vdrm_nms_radius=1, vdrm_initial_match_scale=5.0,
-                 vdrm_initial_match_bias=-2.5):
+                 vdrm_initial_match_bias=-2.5,
+                 vdrm_residual_max_ratio=0.0):
         """
         Args:
             img_size (int, tuple): input image size
@@ -117,6 +118,7 @@ class VisionTransformerCE(VisionTransformer):
                 nms_radius=vdrm_nms_radius,
                 initial_match_scale=vdrm_initial_match_scale,
                 initial_match_bias=vdrm_initial_match_bias,
+                residual_max_ratio=vdrm_residual_max_ratio,
             )
         else:
             self.vdrm = None

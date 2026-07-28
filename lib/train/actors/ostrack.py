@@ -348,6 +348,20 @@ class OSTrackActor(BaseActor):
                         .mean()
                         .item()
                     )
+                residual_status_keys = {
+                    "vdrm_residual_clip_rate": "VDRM/residual_clip_rate",
+                    "vdrm_raw_delta_relative_norm": (
+                        "VDRM/raw_delta_relative_norm"
+                    ),
+                    "vdrm_delta_relative_norm": (
+                        "VDRM/delta_relative_norm"
+                    ),
+                }
+                for output_key, status_key in residual_status_keys.items():
+                    if output_key in pred_dict:
+                        status[status_key] = (
+                            pred_dict[output_key].detach().mean().item()
+                        )
                 if 'part_match_margin' in pred_dict:
                     status.update({
                         "VDRM/match_margin": pred_dict[

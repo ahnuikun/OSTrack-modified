@@ -39,6 +39,8 @@ cfg.MODEL.VDRM.RELIABILITY_MODE = "topk"
 cfg.MODEL.VDRM.NMS_RADIUS = 1
 cfg.MODEL.VDRM.INITIAL_MATCH_SCALE = 5.0
 cfg.MODEL.VDRM.INITIAL_MATCH_BIAS = -2.5
+# 0 disables the V4 relative-norm residual bound for V1/V2/V3 compatibility.
+cfg.MODEL.VDRM.RESIDUAL_MAX_RATIO = 0.0
 
 # MODEL.HEAD
 cfg.MODEL.HEAD = edict()

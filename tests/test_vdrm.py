@@ -96,6 +96,73 @@ class VDRMTest(unittest.TestCase):
         self.assertIsNotNone(tokens.grad)
         self.assertTrue(torch.isfinite(tokens.grad).all())
 
+    def test_relative_norm_bound_caps_the_complete_residual_update(self):
+        torch.manual_seed(11)
+        max_ratio = 0.25
+        module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            topk=4,
+            residual_max_ratio=max_ratio,
+        )
+        module.alpha.data.fill_(-20.0)
+        tokens = torch.randn(2, 64 + 37, 32)
+        template_bbox = torch.tensor(
+            [[0.25, 0.25, 0.50, 0.50]] * 2
+        )
+
+        output, diagnostics = module(
+            tokens,
+            template_length=64,
+            template_bbox=template_bbox,
+        )
+
+        search_input = tokens[:, 64:]
+        search_delta = output[:, 64:] - search_input
+        relative_norm = (
+            torch.linalg.vector_norm(search_delta, dim=-1)
+            / torch.linalg.vector_norm(search_input, dim=-1).clamp_min(1e-6)
+        )
+        self.assertLessEqual(relative_norm.max().item(), max_ratio + 1e-5)
+        self.assertGreater(
+            diagnostics["vdrm_residual_clip_rate"].item(), 0.0
+        )
+        self.assertGreater(
+            diagnostics["vdrm_raw_delta_relative_norm"].item(),
+            diagnostics["vdrm_delta_relative_norm"].item(),
+        )
+
+    def test_disabled_relative_norm_bound_preserves_v1_forward(self):
+        torch.manual_seed(13)
+        default_module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            topk=4,
+        )
+        explicit_v1_module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            topk=4,
+            residual_max_ratio=0.0,
+        )
+        explicit_v1_module.load_state_dict(default_module.state_dict())
+        default_module.alpha.data.fill_(-1.046)
+        explicit_v1_module.alpha.data.copy_(default_module.alpha.data)
+        tokens = torch.randn(2, 64 + 37, 32)
+        template_bbox = torch.tensor(
+            [[0.25, 0.25, 0.50, 0.50]] * 2
+        )
+
+        default_output, _ = default_module(
+            tokens,
+            template_length=64,
+            template_bbox=template_bbox,
+        )
+        explicit_output, _ = explicit_v1_module(
+            tokens,
+            template_length=64,
+            template_bbox=template_bbox,
+        )
+
+        self.assertTrue(torch.equal(default_output, explicit_output))
+
     def test_margin_reliability_suppresses_the_first_peak_neighborhood(self):
         module = VisibilityDrivenRepresentationModule(
             num_parts=4,

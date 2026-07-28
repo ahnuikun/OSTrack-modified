@@ -153,6 +153,7 @@ def main():
     for key in sorted(status):
         print(f"{key}={status[key]}")
     print(f"vdrm_lr={next(iter(vdrm_lrs))}")
+    print(f"vdrm_residual_max_ratio={vdrm.residual_max_ratio}")
     print(f"vdrm_alpha_after_step={vdrm.alpha.detach().item()}")
     if device.type == "cuda":
         peak_memory_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)

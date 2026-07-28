@@ -6,7 +6,9 @@ The first implementation intentionally keeps the design small:
 * each grid cell is represented by masked mean pooling;
 * cosine matching estimates whether each part is visible in the search;
 * matched, reliable prototypes are added to search tokens through one
-  zero-initialized residual scalar.
+  zero-initialized residual scalar;
+* VDRM-v4 can deterministically bound the complete residual update relative
+  to each input search-token norm.
 
 The original ``topk`` reliability is retained for VDRM-v1 checkpoint
 compatibility. VDRM-v2 uses the margin between a part's best match and its
@@ -36,6 +38,7 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         nms_radius: int = 1,
         initial_match_scale: float = 5.0,
         initial_match_bias: float = -2.5,
+        residual_max_ratio: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -53,12 +56,18 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             raise ValueError(
                 f"nms_radius must be non-negative, got {nms_radius}"
             )
+        if residual_max_ratio < 0.0:
+            raise ValueError(
+                "residual_max_ratio must be non-negative, got "
+                f"{residual_max_ratio}"
+            )
 
         self.num_parts = num_parts
         self.part_grid = part_grid
         self.topk = topk
         self.reliability_mode = reliability_mode
         self.nms_radius = nms_radius
+        self.residual_max_ratio = float(residual_max_ratio)
         self.eps = eps
 
         # A shared monotonic calibration is enough for the first version.
@@ -296,9 +305,43 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
         token_match = similarity.max(dim=1).values.clamp_min(0.0)
         residual = reconstructed * token_match.unsqueeze(-1)
+        raw_delta = self.alpha * residual
+
+        # V4 bounds the *complete* update after alpha, so the learned scalar
+        # cannot compensate for the bound by growing in magnitude. The
+        # reference norm is detached to prevent the backbone from increasing
+        # token norms merely to relax the constraint. A ratio of zero retains
+        # the exact V1/V2/V3 forward path and checkpoint behavior.
+        reference_norm = torch.linalg.vector_norm(
+            search_tokens.detach(), dim=-1, keepdim=True
+        )
+        raw_delta_norm = torch.linalg.vector_norm(
+            raw_delta, dim=-1, keepdim=True
+        )
+        if self.residual_max_ratio > 0.0:
+            max_delta_norm = self.residual_max_ratio * reference_norm
+            clip_scale = (
+                max_delta_norm / raw_delta_norm.clamp_min(self.eps)
+            ).clamp(max=1.0)
+            delta = raw_delta * clip_scale
+            residual_clip_rate = (
+                raw_delta_norm > max_delta_norm
+            ).to(raw_delta.dtype).mean()
+        else:
+            delta = raw_delta
+            residual_clip_rate = raw_delta.new_zeros(())
+
+        safe_reference_norm = reference_norm.clamp_min(self.eps)
+        raw_delta_relative_norm = (
+            raw_delta_norm / safe_reference_norm
+        ).mean()
+        delta_relative_norm = (
+            torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+            / safe_reference_norm
+        ).mean()
 
         template_tokens_out = template_tokens
-        search_tokens_out = search_tokens + self.alpha * residual
+        search_tokens_out = search_tokens + delta
         output_tokens = torch.cat(
             [template_tokens_out, search_tokens_out], dim=1
         )
@@ -316,6 +359,9 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "part_valid": part_valid,
             "visual_reliability": visual_reliability,
             "vdrm_alpha": self.alpha,
+            "vdrm_residual_clip_rate": residual_clip_rate,
+            "vdrm_raw_delta_relative_norm": raw_delta_relative_norm,
+            "vdrm_delta_relative_norm": delta_relative_norm,
         }
         diagnostics.update(margin_diagnostics)
         return output_tokens, diagnostics

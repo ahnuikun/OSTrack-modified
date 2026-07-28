@@ -139,6 +139,7 @@ def build_ostrack(cfg, training=True):
                                            vdrm_nms_radius=vdrm_cfg.NMS_RADIUS if vdrm_enabled else 1,
                                            vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                            vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
+                                           vdrm_residual_max_ratio=vdrm_cfg.RESIDUAL_MAX_RATIO if vdrm_enabled else 0.0,
                                            )
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
@@ -157,6 +158,7 @@ def build_ostrack(cfg, training=True):
                                             vdrm_nms_radius=vdrm_cfg.NMS_RADIUS if vdrm_enabled else 1,
                                             vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                             vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
+                                            vdrm_residual_max_ratio=vdrm_cfg.RESIDUAL_MAX_RATIO if vdrm_enabled else 0.0,
                                             )
 
         hidden_dim = backbone.embed_dim

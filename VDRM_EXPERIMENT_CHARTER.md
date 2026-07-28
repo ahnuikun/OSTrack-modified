@@ -610,6 +610,23 @@ conclusion
 - Required new baseline or ablation: 使用同一重训 OSTrack 和 VDRM-v1 对照 VDRM-v3-HNCP；先检查应用率及四个登记序列，再统一测试五个数据集。不得同时修改可靠性、残差或损失。
 - Decision: approved。用户于 2026-07-27 明确要求下一版从 V1 回退并只做一个受控改动，禁止继续堆叠 margin、门控或额外质量头。
 
+## Change-20260728-01
+
+- Proposed change: 放弃将 V3-HNCP 作为下一版起点，再次回退到 VDRM-v1；只对 `alpha` 乘入后的完整搜索 token 残差施加相对输入 token 范数上限。
+- Reason: V3 的真实同类 Copy-Paste 虽提高四个无人机数据集的平均 AUC，但在登记序列中产生了新的严重回归；继续调整 HNCP 概率或增加可靠性判断不能直接解决高置信度错误身份锁定。V1/V3 的自由标量最终均达到约 `alpha=-1.046`，当前残差没有幅度安全边界，错误匹配可以把完整模板原型更新注入后续骨干。
+- Evidence: V3 相对 V1 在 `uav_car7` 的平均 IoU 从 `0.4236` 降至 `0.1594`，首次持续失败从第 271 帧提前到第 219 帧；`uav_car9` 从 `0.8612` 降至 `0.3700`，并从无持续失败变为第 800 帧后持续漂移。`uav_car7` 失败后的视觉可靠性约 `0.82–0.84`、第一响应峰约 `0.89`、第二峰比约 `0.001–0.003`，说明这是高置信度错误身份锁定，不是增加 margin 或置信度门控能够纠正的问题。
+- Controlled variable: 新增固定 `RESIDUAL_MAX_RATIO=0.05`。设原搜索 token 为 \(f_i\)，未经限制的完整更新为 \(d_i=\alpha r_i\)，V4 使用
+  \[
+  d'_i=d_i\min\left(1,\frac{0.05\lVert f_i\rVert_2}{\lVert d_i\rVert_2+\epsilon}\right),
+  \qquad f'_i=f_i+d'_i.
+  \]
+  上限参考范数停止梯度，避免骨干通过增大 token 范数绕开约束。该操作无新增可学习参数、无阈值分支、无质量头、无新损失；`alpha=0` 时仍严格保持 OSTrack 前向路径。
+- Bound registration: `0.05` 在训练前通过合成整网探针固定。使用 V1 最终量级 `alpha=-1.046` 时，未经限制的平均更新约为输入 token 范数的 `0.0478`；`0.25/0.10/0.075` 均完全不介入，`0.03` 对全部 token 裁剪，`0.05` 仅裁剪约 `34.4%` 的高幅度尾部并将平均更新从 `0.0478` 降至 `0.0463`。因此选择 `0.05` 作为“限制异常尾部而不压平主体更新”的一次性预注册值，不依据任何测试集结果调整。
+- Compatibility: 默认 `RESIDUAL_MAX_RATIO=0.0` 表示关闭约束，V1、V2、V3 的配置、checkpoint 与前向结果保持兼容。V4 明确关闭 HNCP，网络、Top-4 可靠性、结构化遮挡、两个辅助损失、warm-up、训练数据和完整训练协议均回到 V1。
+- Observability: 训练日志和逐帧诊断新增 `residual_clip_rate`、`raw_delta_relative_norm`、`delta_relative_norm`。这些字段只用于判断约束是否介入，不参与前向决策或损失。
+- Required comparison: 同协议比较重训 OSTrack、VDRM-v1、VDRM-v3-HNCP、VDRM-v4-BR。完整测试前先检查 `uav_car7`、`uav_car9`、`uav_car12`、`uav_car15`；V4 至少不得重现 V3 在 car7/car9 上的新回归，同时观察 car15 是否改善。
+- Decision: approved。用户于 2026-07-28 要求在 CTMP 尚未完成时继续优化一个版本的模块一；本次仅实施残差范数边界。
+
 ## 13. 第一版实现状态与执行入口
 
 截至第一版实现，已完成：
@@ -706,3 +723,39 @@ python tracking/train.py \
 ```
 
 训练日志中检查 `VDRM/distractor_applied_rate` 是否长期大于 0 且大致围绕配置概率波动。该统计只验证数据增强确实生效，不能单独作为效果结论。
+
+## 15. VDRM-v4-BR 设计与执行入口
+
+VDRM-v4-BR（Bounded Residual）从 V1 配置出发，只限制 VDRM 对每个搜索 token 的完整残差更新幅度：
+
+- `RESIDUAL_MAX_RATIO: 0.05`；
+- HNCP 明确关闭，`VDRM_DISTRACTOR_PROBABILITY: 0.0`；
+- 不改变 Top-4 可靠性、部件原型、残差方向、插入层、损失或训练协议；
+- 不增加参数、margin、门控、质量头或推理阈值；
+- V1/V2/V3 默认使用 `RESIDUAL_MAX_RATIO: 0.0`，保持旧实验行为。
+
+配置：
+
+```text
+experiments/ostrack/vitb_256_mae_ce_vdrm_v4_br_32x4_ep300.yaml
+```
+
+服务器首先执行：
+
+```bash
+python -m unittest discover -s tests -v
+
+CUDA_VISIBLE_DEVICES=0 \
+python tracking/smoke_test_vdrm.py \
+  --config experiments/ostrack/vitb_256_mae_ce_vdrm_v4_br_32x4_ep300.yaml \
+  --device cuda
+```
+
+只有上述检查和短 DDP 检查通过后，才启动完整训练。训练日志必须同时保留：
+
+- `VDRM/alpha`；
+- `VDRM/residual_clip_rate`；
+- `VDRM/raw_delta_relative_norm`；
+- `VDRM/delta_relative_norm`。
+
+若 `residual_clip_rate` 长期接近 0，说明上限没有实际介入，V4 不能用于证明残差边界有效；若长期接近 1，则需要结合主损失和验证结果判断是否约束过强，不允许只凭裁剪率修改上限。

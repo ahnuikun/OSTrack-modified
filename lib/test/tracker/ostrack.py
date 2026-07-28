@@ -157,6 +157,21 @@ class OSTrack(BaseTracker):
         vdrm_alpha = out_dict.get('vdrm_alpha')
         if vdrm_alpha is not None:
             vdrm_alpha = vdrm_alpha.detach().item()
+        residual_clip_rate = out_dict.get('vdrm_residual_clip_rate')
+        if residual_clip_rate is not None:
+            residual_clip_rate = residual_clip_rate.detach().mean().item()
+        raw_delta_relative_norm = out_dict.get(
+            'vdrm_raw_delta_relative_norm'
+        )
+        if raw_delta_relative_norm is not None:
+            raw_delta_relative_norm = (
+                raw_delta_relative_norm.detach().mean().item()
+            )
+        delta_relative_norm = out_dict.get('vdrm_delta_relative_norm')
+        if delta_relative_norm is not None:
+            delta_relative_norm = (
+                delta_relative_norm.detach().mean().item()
+            )
         response = self.output_window * pred_score_map
         pred_boxes = self.network.box_head.cal_bbox(response, out_dict['size_map'], out_dict['offset_map'])
         pred_boxes = pred_boxes.view(-1, 4)
@@ -207,7 +222,10 @@ class OSTrack(BaseTracker):
                     "part_peak_similarity": part_peak_similarity,
                     "part_hard_negative_similarity": part_hard_negative_similarity,
                     "part_match_margin": part_match_margin,
-                    "vdrm_alpha": vdrm_alpha}
+                    "vdrm_alpha": vdrm_alpha,
+                    "vdrm_residual_clip_rate": residual_clip_rate,
+                    "vdrm_raw_delta_relative_norm": raw_delta_relative_norm,
+                    "vdrm_delta_relative_norm": delta_relative_norm}
         else:
             return {
                 "target_bbox": self.state,
@@ -220,6 +238,9 @@ class OSTrack(BaseTracker):
                 "part_hard_negative_similarity": part_hard_negative_similarity,
                 "part_match_margin": part_match_margin,
                 "vdrm_alpha": vdrm_alpha,
+                "vdrm_residual_clip_rate": residual_clip_rate,
+                "vdrm_raw_delta_relative_norm": raw_delta_relative_norm,
+                "vdrm_delta_relative_norm": delta_relative_norm,
             }
 
     def map_box_back(self, pred_box: list, resize_factor: float):

@@ -269,7 +269,13 @@ def summarize_rows(rows):
         "response_p1",
         "response_peak_margin",
         "response_entropy_normalized",
-    ] + part_metrics
+    ]
+    residual_metrics = [
+        "vdrm_residual_clip_rate",
+        "vdrm_raw_delta_relative_norm",
+        "vdrm_delta_relative_norm",
+    ]
+    reliability_metrics = reliability_metrics + residual_metrics + part_metrics
     metric_summary = {}
     for metric in reliability_metrics:
         metric_summary[metric] = {
@@ -348,6 +354,15 @@ def _diagnostic_row(frame_index, frame_path, ground_truth, tracker_output, elaps
         "visual_reliability", math.nan
     )
     row["vdrm_alpha"] = tracker_output.get("vdrm_alpha", math.nan)
+    row["vdrm_residual_clip_rate"] = tracker_output.get(
+        "vdrm_residual_clip_rate", math.nan
+    )
+    row["vdrm_raw_delta_relative_norm"] = tracker_output.get(
+        "vdrm_raw_delta_relative_norm", math.nan
+    )
+    row["vdrm_delta_relative_norm"] = tracker_output.get(
+        "vdrm_delta_relative_norm", math.nan
+    )
 
     part_reliability = tracker_output.get("part_reliability")
     part_valid = tracker_output.get("part_valid")
@@ -399,6 +414,9 @@ def _initial_row(sequence):
         "max_score": math.nan,
         "visual_reliability": math.nan,
         "vdrm_alpha": math.nan,
+        "vdrm_residual_clip_rate": math.nan,
+        "vdrm_raw_delta_relative_norm": math.nan,
+        "vdrm_delta_relative_norm": math.nan,
         "response_p1": math.nan,
         "response_p2": math.nan,
         "response_peak_ratio": math.nan,
@@ -483,6 +501,17 @@ def _print_summary(sequence_name, summary, csv_path, json_path):
             f"failed={values['mean_failed']}, "
             f"spearman_iou={values['spearman_with_iou']}, "
             f"auc={values['correct_vs_failed_auc']}"
+        )
+    for metric in (
+        "vdrm_residual_clip_rate",
+        "vdrm_raw_delta_relative_norm",
+        "vdrm_delta_relative_norm",
+    ):
+        values = summary["metrics"][metric]
+        print(
+            f"{metric}: correct={values['mean_correct']}, "
+            f"failed={values['mean_failed']}, "
+            f"spearman_iou={values['spearman_with_iou']}"
         )
     for metric, values in summary["metrics"].items():
         if metric.startswith("part_"):
