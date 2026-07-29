@@ -72,6 +72,9 @@ cfg.TRAIN.VDRM_VISIBILITY_WEIGHT = 0.5
 cfg.TRAIN.VDRM_RANK_WEIGHT = 0.5
 cfg.TRAIN.VDRM_RANK_MARGIN = 0.1
 cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS = 20
+# V5-only switch. When enabled, HNCP samples take the rank negative from the
+# pasted distractor box instead of an unrelated maximum over all background.
+cfg.TRAIN.VDRM_ALIGN_DISTRACTOR_RANK = False
 
 # TRAIN.SCHEDULER
 cfg.TRAIN.SCHEDULER = edict()

@@ -176,6 +176,7 @@ class STARKProcessing(BaseProcessing):
                     return data
 
         distractor_applied = False
+        pasted_distractor_box = data["search_images"][0].new_zeros(4)
         if has_distractor:
             distractor_crops, distractor_boxes, distractor_att, distractor_mask_crops = (
                 prutils.jittered_center_crop(
@@ -200,7 +201,11 @@ class STARKProcessing(BaseProcessing):
                 joint=False,
             )
             if not transformed_distractor_att[0].all():
-                data["search_images"][0], distractor_applied = (
+                (
+                    data["search_images"][0],
+                    distractor_applied,
+                    pasted_distractor_box,
+                ) = (
                     apply_same_class_distractor_copy_paste(
                         data["search_images"][0],
                         data["search_anno"][0],
@@ -215,6 +220,9 @@ class STARKProcessing(BaseProcessing):
         data["vdrm_distractor_applied"] = torch.tensor(
             [float(distractor_applied)], dtype=torch.float32
         )
+        # Keep the leading search-frame dimension used by search_anno. The
+        # actor flattens this metadata after batch collation.
+        data["vdrm_distractor_box"] = pasted_distractor_box.unsqueeze(0)
         data['valid'] = True
         # if we use copy-and-paste augmentation
         if data["template_masks"] is None or data["search_masks"] is None:

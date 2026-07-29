@@ -39,13 +39,15 @@ def apply_same_class_distractor_copy_paste(
     max_scale: float = 1.3,
     invalid_mask: torch.Tensor | None = None,
     max_attempts: int = 24,
-) -> Tuple[torch.Tensor, bool]:
+) -> Tuple[torch.Tensor, bool, torch.Tensor]:
     """Paste one real same-class instance outside the labelled target.
 
     Both images are already transformed and normalized. The source is cropped
     by its ground-truth box, resized relative to the labelled target area, and
     pasted only where it does not overlap the target or padded search pixels.
-    The target box and all training labels remain unchanged.
+    The target box and all training labels remain unchanged. The returned box
+    is the normalized ``xywh`` location of the pasted distractor in ``image``;
+    it is all-zero when no paste is applied.
     """
     if image.ndim != 3 or distractor_image.ndim != 3:
         raise ValueError(
@@ -61,6 +63,7 @@ def apply_same_class_distractor_copy_paste(
     if max_attempts < 1:
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
 
+    empty_paste_box = image.new_zeros(4)
     _, height, width = image.shape
     _, source_height, source_width = distractor_image.shape
     target_x0, target_y0, target_x1, target_y1 = _normalized_box_bounds(
@@ -80,7 +83,7 @@ def apply_same_class_distractor_copy_paste(
         source_width_box,
         source_height_box,
     ) < 2:
-        return image.clone(), False
+        return image.clone(), False, empty_paste_box
 
     source_patch = distractor_image[
         :, source_y0:source_y1, source_x0:source_x1
@@ -93,7 +96,7 @@ def apply_same_class_distractor_copy_paste(
     paste_width = max(2, int(round((desired_area * source_aspect) ** 0.5)))
     paste_height = max(2, int(round((desired_area / source_aspect) ** 0.5)))
     if paste_width > width or paste_height > height:
-        return image.clone(), False
+        return image.clone(), False, empty_paste_box
 
     if invalid_mask is not None:
         invalid_mask = invalid_mask.to(device=image.device, dtype=torch.bool)
@@ -137,7 +140,7 @@ def apply_same_class_distractor_copy_paste(
         break
 
     if paste_x0 is None or paste_y0 is None:
-        return image.clone(), False
+        return image.clone(), False, empty_paste_box
 
     resized_patch = F.interpolate(
         source_patch.unsqueeze(0),
@@ -175,7 +178,15 @@ def apply_same_class_distractor_copy_paste(
         resized_patch.to(dtype=image.dtype) * alpha
         + destination * (1.0 - alpha)
     )
-    return output, True
+    paste_box = image.new_tensor(
+        [
+            paste_x0 / width,
+            paste_y0 / height,
+            paste_width / width,
+            paste_height / height,
+        ]
+    )
+    return output, True, paste_box
 
 
 @torch.no_grad()

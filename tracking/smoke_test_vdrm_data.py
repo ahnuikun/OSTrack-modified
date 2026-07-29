@@ -68,12 +68,35 @@ def main():
 
     applied = 0
     observed = 0
+    check_alignment_boxes = bool(
+        getattr(cfg.TRAIN, "VDRM_ALIGN_DISTRACTOR_RANK", False)
+    )
     for batch_index, batch in enumerate(loader_train):
         flags = batch["vdrm_distractor_applied"].detach().float()
         if not torch.isfinite(flags).all():
             raise RuntimeError("non-finite distractor flags")
         applied += int(flags.sum().item())
         observed += flags.numel()
+        if check_alignment_boxes:
+            boxes = batch["vdrm_distractor_box"].detach().float().reshape(-1, 4)
+            flat_flags = flags.reshape(-1).bool()
+            if boxes.shape[0] != flat_flags.shape[0]:
+                raise RuntimeError(
+                    "distractor boxes and flags have different batch sizes"
+                )
+            if not torch.isfinite(boxes).all():
+                raise RuntimeError("non-finite distractor boxes")
+            applied_boxes = boxes[flat_flags]
+            if applied_boxes.numel() and (
+                (applied_boxes[:, :2] < 0.0).any()
+                or (applied_boxes[:, 2:] <= 0.0).any()
+                or (
+                    applied_boxes[:, :2] + applied_boxes[:, 2:] > 1.0
+                ).any()
+            ):
+                raise RuntimeError(
+                    "applied distractor boxes are outside normalized xywh bounds"
+                )
         print(
             f"batch={batch_index + 1} "
             f"search_shape={tuple(batch['search_images'].shape)} "

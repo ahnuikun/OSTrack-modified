@@ -4,7 +4,10 @@ import numpy as np
 import torch
 
 from lib.models.layers.vdrm import VisibilityDrivenRepresentationModule
-from lib.train.actors.ostrack import compute_vdrm_part_rank_loss
+from lib.train.actors.ostrack import (
+    compute_vdrm_part_rank_loss,
+    compute_vdrm_response_rank_loss,
+)
 from lib.train.data.sampler import TrackingSampler
 from lib.train.data.vdrm_augmentation import (
     apply_same_class_distractor_copy_paste,
@@ -248,6 +251,76 @@ class VDRMTest(unittest.TestCase):
         self.assertIsNotNone(good_similarity.grad)
         self.assertTrue(torch.isfinite(good_similarity.grad).all())
 
+    def test_response_rank_uses_pasted_distractor_for_applied_samples(self):
+        score_logits = torch.zeros(2, 4, 4, requires_grad=True)
+        with torch.no_grad():
+            score_logits[:, 1, 1] = 2.0
+            score_logits[0, 0, 0] = 1.0
+            score_logits[:, 3, 3] = 5.0
+        gaussian_map = torch.zeros_like(score_logits)
+        gaussian_map[:, 1, 1] = 1.0
+        distractor_boxes = torch.tensor(
+            [
+                [0.00, 0.00, 0.25, 0.25],
+                [0.00, 0.00, 0.00, 0.00],
+            ]
+        )
+        distractor_applied = torch.tensor([1.0, 0.0])
+
+        loss, diagnostics = compute_vdrm_response_rank_loss(
+            score_logits,
+            gaussian_map,
+            distractor_boxes=distractor_boxes,
+            distractor_applied=distractor_applied,
+        )
+        expected = (
+            torch.nn.functional.softplus(torch.tensor(1.0 - 2.0))
+            + torch.nn.functional.softplus(torch.tensor(5.0 - 2.0))
+        ) / 2.0
+
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertEqual(diagnostics["alignment_success_rate"].item(), 1.0)
+        self.assertEqual(diagnostics["distractor_rank_margin"].item(), 1.0)
+        loss.backward()
+        self.assertNotEqual(score_logits.grad[0, 0, 0].item(), 0.0)
+        self.assertEqual(score_logits.grad[0, 3, 3].item(), 0.0)
+
+    def test_response_rank_without_alignment_preserves_global_negative(self):
+        score_logits = torch.zeros(1, 4, 4)
+        score_logits[0, 1, 1] = 2.0
+        score_logits[0, 0, 0] = 1.0
+        score_logits[0, 3, 3] = 5.0
+        gaussian_map = torch.zeros_like(score_logits)
+        gaussian_map[0, 1, 1] = 1.0
+
+        loss, diagnostics = compute_vdrm_response_rank_loss(
+            score_logits,
+            gaussian_map,
+        )
+
+        expected = torch.nn.functional.softplus(torch.tensor(5.0 - 2.0))
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertEqual(diagnostics["alignment_success_rate"].item(), 0.0)
+
+    def test_response_rank_maps_tiny_distractor_to_nearest_cell(self):
+        score_logits = torch.zeros(1, 4, 4)
+        score_logits[0, 2, 2] = 2.0
+        score_logits[0, 0, 0] = 1.0
+        score_logits[0, 3, 3] = 5.0
+        gaussian_map = torch.zeros_like(score_logits)
+        gaussian_map[0, 2, 2] = 1.0
+
+        loss, diagnostics = compute_vdrm_response_rank_loss(
+            score_logits,
+            gaussian_map,
+            distractor_boxes=torch.tensor([[0.01, 0.01, 0.01, 0.01]]),
+            distractor_applied=torch.tensor([1.0]),
+        )
+
+        expected = torch.nn.functional.softplus(torch.tensor(1.0 - 2.0))
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertEqual(diagnostics["alignment_success_rate"].item(), 1.0)
+
     def test_structured_occlusion_returns_soft_part_labels(self):
         torch.manual_seed(2)
         images = torch.ones(2, 3, 32, 32)
@@ -318,7 +391,7 @@ class VDRMTest(unittest.TestCase):
         target_box = torch.tensor([0.375, 0.375, 0.25, 0.25])
         distractor_box = torch.tensor([0.25, 0.25, 0.50, 0.50])
 
-        augmented, applied = apply_same_class_distractor_copy_paste(
+        augmented, applied, pasted_box = apply_same_class_distractor_copy_paste(
             image,
             target_box,
             distractor,
@@ -331,6 +404,22 @@ class VDRMTest(unittest.TestCase):
         self.assertTrue(applied)
         self.assertGreater(augmented.count_nonzero().item(), 0)
         self.assertTrue(torch.equal(augmented[:, 24:40, 24:40], image[:, 24:40, 24:40]))
+        self.assertTrue((pasted_box >= 0.0).all())
+        self.assertTrue((pasted_box <= 1.0).all())
+        self.assertGreater(pasted_box[2].item(), 0.0)
+        self.assertGreater(pasted_box[3].item(), 0.0)
+
+        paste_x0 = int(round(pasted_box[0].item() * 64))
+        paste_y0 = int(round(pasted_box[1].item() * 64))
+        paste_x1 = int(round((pasted_box[0] + pasted_box[2]).item() * 64))
+        paste_y1 = int(round((pasted_box[1] + pasted_box[3]).item() * 64))
+        overlaps_target = not (
+            paste_x1 <= 24
+            or paste_x0 >= 40
+            or paste_y1 <= 24
+            or paste_y0 >= 40
+        )
+        self.assertFalse(overlaps_target)
 
 
 if __name__ == "__main__":

@@ -759,3 +759,40 @@ python tracking/smoke_test_vdrm.py \
 - `VDRM/delta_relative_norm`。
 
 若 `residual_clip_rate` 长期接近 0，说明上限没有实际介入，V4 不能用于证明残差边界有效；若长期接近 1，则需要结合主损失和验证结果判断是否约束过强，不允许只凭裁剪率修改上限。
+
+## Change-20260729-01
+
+- Proposed change: 放弃 V4 作为下一版起点，完整回到 V3-HNCP；只把 HNCP 实际粘贴框传给 `L_rank`，使已应用 HNCP 的样本使用粘贴框内最高 Center Head 响应作为硬负样本。未应用 HNCP 的样本继续使用全背景最高响应。
+- Reason: V3 已加入真实同类干扰，但原增强函数只返回是否粘贴，没有返回粘贴坐标；`L_rank` 因此仍在整个背景中盲选最高响应，训练监督未必作用于刚加入的同类干扰。
+- Evidence: V4 相对 V3 的 AUC 在 VisDrone、UAV123、UAVDT、DTB70、LaSOT 上分别变化 `+0.18/-0.57/-2.25/+0.63/-0.10`，不能替代 V3 主线。代码审计确认 V3 的 `vdrm_distractor_applied` 仅用于日志，而原排序负样本由 `gaussian_map <= 0` 的全部位置直接取最大值，HNCP 位置没有进入损失选择。
+- Controlled variable: 新增固定布尔开关 `TRAIN.VDRM_ALIGN_DISTRACTOR_RANK=True`。排序形式仍为 `softplus(l_neg-l_pos)`，权重仍为 `0.5`；只将 HNCP 已应用样本的 `l_neg` 选取区域从“全部背景”改为“粘贴框与背景的交集”。极小干扰框没有覆盖响应图单元中心时，使用距离干扰框中心最近的背景单元，避免静默丢弃监督。
+- Compatibility: 默认开关为 `False`，V1/V2/V3/V4 的已有配置仍保持原全背景硬负样本行为。V5 明确使用 V3 的网络、Top-4 可靠性、无边界残差、HNCP 概率、数据、损失、warm-up 和训练协议。
+- Observability: 新增 `VDRM/alignment_success_rate` 和 `VDRM/distractor_rank_margin`，只用于检查坐标传递和排序难度，不参与前向融合、门控或损失加权。
+- Does it change a locked item: no。四数据集、1:1:1:1、60000 samples/epoch、300 epoch、epoch 240 降学习率、学习率、CE 位置、Block 6 插入、损失权重和 checkpoint 策略均不变。
+- Required new baseline or ablation: 同协议比较重训 OSTrack、VDRM-v3-HNCP 与 VDRM-v5-AHNCP；先检查四个登记序列，再统一测试五个数据集。不得同时修改 HNCP 概率、可靠性、残差、margin、门控或质量头。
+- Decision: approved。用户于 2026-07-29 明确要求下一版回到 V3，只修正 HNCP 干扰位置与排序监督不对齐。
+
+## 16. VDRM-v5-AHNCP 设计与执行入口
+
+V5 是 V3 的受控监督对齐版本，不增加网络结构或可学习参数：
+
+1. HNCP 完成粘贴后返回搜索图坐标系中的归一化 `xywh` 干扰框；
+2. 数据处理将干扰框与 `vdrm_distractor_applied` 一同传给 Actor；
+3. 对已应用 HNCP 的样本，在粘贴框内取最高背景响应 `l_neg`；
+4. 对未应用 HNCP 或元数据无效的样本，保持 V3 的全背景最高响应回退；
+5. 正样本响应、排序函数、辅助损失权重及 warm-up 均不改变。
+
+配置：
+
+```text
+experiments/ostrack/vitb_256_mae_ce_vdrm_v5_ahncp_32x4_ep300.yaml
+```
+
+训练前必须观察：
+
+- `VDRM/distractor_applied_rate`：实际应用 HNCP 的 batch 比例；
+- `VDRM/alignment_success_rate`：已应用 HNCP 的样本中成功找到对齐负样本的比例，正常应接近 `1.0`；
+- `VDRM/distractor_rank_margin`：真实目标峰减去粘贴干扰峰，允许训练早期为负，但应结合 `Loss/vdrm_rank` 观察其趋势；
+- `VDRM/alpha` 与 V3 的演化是否同量级，防止无关结构变化。
+
+上述诊断只判断实现和优化过程，不能代替完整数据集效果对比。V5 不允许根据单个测试数据集另设阈值或参数。

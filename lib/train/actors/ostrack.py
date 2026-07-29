@@ -111,6 +111,148 @@ def compute_vdrm_part_rank_loss(
     return (element_loss * loss_weight).sum() / loss_weight.sum().clamp_min(1.0)
 
 
+def compute_vdrm_response_rank_loss(
+    score_logits,
+    gaussian_map,
+    distractor_boxes=None,
+    distractor_applied=None,
+):
+    """Rank the target response above a hard background response.
+
+    The original V1/V3 behavior uses the maximum response over all background
+    cells. When HNCP metadata is supplied, an applied sample instead uses the
+    maximum response whose cell center lies inside the pasted distractor box.
+    A very small valid paste that contains no cell center is represented by the
+    closest background cell, so the supervision is not silently discarded.
+    """
+    if score_logits.ndim != 3:
+        raise ValueError(
+            "score_logits must have shape [B, H, W], got "
+            f"{tuple(score_logits.shape)}"
+        )
+    if gaussian_map.shape != score_logits.shape:
+        raise ValueError(
+            "gaussian_map must match score_logits, got "
+            f"{tuple(gaussian_map.shape)} and {tuple(score_logits.shape)}"
+        )
+
+    batch_size, height, width = score_logits.shape
+    gaussian_map = gaussian_map.to(
+        device=score_logits.device, dtype=score_logits.dtype
+    )
+    positive_index = gaussian_map.flatten(1).argmax(dim=1, keepdim=True)
+    positive_logit = score_logits.flatten(1).gather(
+        dim=1, index=positive_index
+    ).squeeze(1)
+
+    negative_mask = gaussian_map <= 0.0
+    has_negative = negative_mask.flatten(1).any(dim=1)
+    global_negative_logit = score_logits.masked_fill(
+        ~negative_mask, -torch.inf
+    ).flatten(1).amax(dim=1)
+    selected_negative_logit = global_negative_logit
+    aligned_mask = torch.zeros(
+        batch_size, device=score_logits.device, dtype=torch.bool
+    )
+    applied_mask = torch.zeros_like(aligned_mask)
+
+    if distractor_boxes is not None and distractor_applied is not None:
+        boxes = distractor_boxes.to(
+            device=score_logits.device, dtype=score_logits.dtype
+        ).reshape(-1, 4)
+        applied_mask = distractor_applied.to(
+            device=score_logits.device, dtype=torch.bool
+        ).reshape(-1)
+        if boxes.shape[0] != batch_size or applied_mask.shape[0] != batch_size:
+            raise ValueError(
+                "distractor metadata batch size must match score_logits, got "
+                f"{boxes.shape[0]}, {applied_mask.shape[0]}, and {batch_size}"
+            )
+
+        x0 = boxes[:, 0].clamp(0.0, 1.0)
+        y0 = boxes[:, 1].clamp(0.0, 1.0)
+        x1 = (boxes[:, 0] + boxes[:, 2]).clamp(0.0, 1.0)
+        y1 = (boxes[:, 1] + boxes[:, 3]).clamp(0.0, 1.0)
+        valid_box = (x1 > x0) & (y1 > y0)
+        requested_alignment = applied_mask & valid_box & has_negative
+
+        cell_x = (
+            torch.arange(width, device=score_logits.device, dtype=score_logits.dtype)
+            + 0.5
+        ) / width
+        cell_y = (
+            torch.arange(height, device=score_logits.device, dtype=score_logits.dtype)
+            + 0.5
+        ) / height
+        box_mask = (
+            (cell_x[None, None, :] >= x0[:, None, None])
+            & (cell_x[None, None, :] < x1[:, None, None])
+            & (cell_y[None, :, None] >= y0[:, None, None])
+            & (cell_y[None, :, None] < y1[:, None, None])
+        )
+        distractor_negative_mask = box_mask & negative_mask
+
+        # Tiny pasted objects can fall between score-map cell centers. Map
+        # those boxes to the nearest valid background cell to retain alignment.
+        missing_cell = requested_alignment & ~distractor_negative_mask.flatten(1).any(dim=1)
+        if missing_cell.any():
+            center_x = ((x0 + x1) * 0.5)[:, None, None]
+            center_y = ((y0 + y1) * 0.5)[:, None, None]
+            squared_distance = (
+                (cell_x[None, None, :] - center_x).square()
+                + (cell_y[None, :, None] - center_y).square()
+            )
+            squared_distance = squared_distance.masked_fill(
+                ~negative_mask, torch.inf
+            )
+            nearest_index = squared_distance.flatten(1).argmin(
+                dim=1, keepdim=True
+            )
+            fallback_mask = torch.zeros_like(
+                negative_mask.flatten(1), dtype=torch.bool
+            )
+            fallback_mask.scatter_(1, nearest_index, True)
+            distractor_negative_mask = distractor_negative_mask | (
+                missing_cell[:, None, None]
+                & fallback_mask.view(batch_size, height, width)
+            )
+
+        aligned_mask = requested_alignment & distractor_negative_mask.flatten(1).any(dim=1)
+        distractor_negative_logit = score_logits.masked_fill(
+            ~distractor_negative_mask, -torch.inf
+        ).flatten(1).amax(dim=1)
+        selected_negative_logit = torch.where(
+            aligned_mask,
+            distractor_negative_logit,
+            global_negative_logit,
+        )
+
+    if has_negative.any():
+        rank_loss = F.softplus(
+            selected_negative_logit[has_negative]
+            - positive_logit[has_negative]
+        ).mean()
+    else:
+        rank_loss = score_logits.sum() * 0.0
+
+    applied_count = applied_mask.float().sum()
+    alignment_success_rate = (
+        aligned_mask.float().sum() / applied_count.clamp_min(1.0)
+    )
+    if aligned_mask.any():
+        distractor_rank_margin = (
+            positive_logit[aligned_mask]
+            - selected_negative_logit[aligned_mask]
+        ).mean()
+    else:
+        distractor_rank_margin = score_logits.new_zeros(())
+    diagnostics = {
+        "alignment_success_rate": alignment_success_rate,
+        "distractor_rank_margin": distractor_rank_margin,
+    }
+    return rank_loss, diagnostics
+
+
 class OSTrackActor(BaseActor):
     """ Actor for training OSTrack models """
 
@@ -231,6 +373,7 @@ class OSTrackActor(BaseActor):
             location_loss = torch.tensor(0.0, device=l1_loss.device)
         visibility_loss = pred_boxes.new_zeros(())
         rank_loss = pred_boxes.new_zeros(())
+        rank_diagnostics = None
         aux_weight_scale = 0.0
 
         vdrm_cfg = getattr(self.cfg.MODEL, "VDRM", None)
@@ -288,23 +431,28 @@ class OSTrackActor(BaseActor):
             elif 'score_logits' in pred_dict:
                 score_logits = pred_dict['score_logits'].squeeze(1)
                 gaussian_map = gt_gaussian_maps.squeeze(1)
-                positive_index = gaussian_map.flatten(1).argmax(
-                    dim=1, keepdim=True
+                align_distractor_rank = bool(
+                    getattr(
+                        self.cfg.TRAIN,
+                        'VDRM_ALIGN_DISTRACTOR_RANK',
+                        False,
+                    )
                 )
-                positive_logit = score_logits.flatten(1).gather(
-                    dim=1, index=positive_index
-                ).squeeze(1)
-
-                negative_mask = gaussian_map <= 0.0
-                has_negative = negative_mask.flatten(1).any(dim=1)
-                negative_logit = score_logits.masked_fill(
-                    ~negative_mask, -torch.inf
-                ).flatten(1).amax(dim=1)
-                if has_negative.any():
-                    rank_loss = F.softplus(
-                        negative_logit[has_negative]
-                        - positive_logit[has_negative]
-                    ).mean()
+                distractor_boxes = None
+                distractor_applied = None
+                if align_distractor_rank:
+                    distractor_boxes = gt_dict.get('vdrm_distractor_box')
+                    distractor_applied = gt_dict.get(
+                        'vdrm_distractor_applied'
+                    )
+                rank_loss, rank_diagnostics = (
+                    compute_vdrm_response_rank_loss(
+                        score_logits,
+                        gaussian_map,
+                        distractor_boxes=distractor_boxes,
+                        distractor_applied=distractor_applied,
+                    )
+                )
 
             warmup_epochs = self.cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS
             epoch = float(gt_dict.get('epoch', 1))
@@ -348,6 +496,25 @@ class OSTrackActor(BaseActor):
                         .mean()
                         .item()
                     )
+                if rank_diagnostics is not None and bool(
+                    getattr(
+                        self.cfg.TRAIN,
+                        'VDRM_ALIGN_DISTRACTOR_RANK',
+                        False,
+                    )
+                ):
+                    status.update({
+                        "VDRM/alignment_success_rate": (
+                            rank_diagnostics["alignment_success_rate"]
+                            .detach()
+                            .item()
+                        ),
+                        "VDRM/distractor_rank_margin": (
+                            rank_diagnostics["distractor_rank_margin"]
+                            .detach()
+                            .item()
+                        ),
+                    })
                 residual_status_keys = {
                     "vdrm_residual_clip_rate": "VDRM/residual_clip_rate",
                     "vdrm_raw_delta_relative_norm": (
