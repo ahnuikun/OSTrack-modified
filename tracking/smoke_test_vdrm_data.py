@@ -68,8 +68,10 @@ def main():
 
     applied = 0
     observed = 0
-    check_alignment_boxes = bool(
+    check_distractor_boxes = bool(
         getattr(cfg.TRAIN, "VDRM_ALIGN_DISTRACTOR_RANK", False)
+    ) or bool(
+        getattr(cfg.TRAIN, "VDRM_LOG_DISTRACTOR_HARDNESS", False)
     )
     for batch_index, batch in enumerate(loader_train):
         flags = batch["vdrm_distractor_applied"].detach().float()
@@ -77,7 +79,7 @@ def main():
             raise RuntimeError("non-finite distractor flags")
         applied += int(flags.sum().item())
         observed += flags.numel()
-        if check_alignment_boxes:
+        if check_distractor_boxes:
             boxes = batch["vdrm_distractor_box"].detach().float().reshape(-1, 4)
             flat_flags = flags.reshape(-1).bool()
             if boxes.shape[0] != flat_flags.shape[0]:

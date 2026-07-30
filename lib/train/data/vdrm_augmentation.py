@@ -39,6 +39,7 @@ def apply_same_class_distractor_copy_paste(
     max_scale: float = 1.3,
     invalid_mask: torch.Tensor | None = None,
     max_attempts: int = 24,
+    placement_mode: str = "random",
 ) -> Tuple[torch.Tensor, bool, torch.Tensor]:
     """Paste one real same-class instance outside the labelled target.
 
@@ -47,7 +48,9 @@ def apply_same_class_distractor_copy_paste(
     pasted only where it does not overlap the target or padded search pixels.
     The target box and all training labels remain unchanged. The returned box
     is the normalized ``xywh`` location of the pasted distractor in ``image``;
-    it is all-zero when no paste is applied.
+    it is all-zero when no paste is applied. ``random`` preserves the V3/V5
+    first-valid placement. ``nearest`` evaluates all sampled valid candidates
+    and selects the one closest to the labelled target after size normalization.
     """
     if image.ndim != 3 or distractor_image.ndim != 3:
         raise ValueError(
@@ -62,6 +65,11 @@ def apply_same_class_distractor_copy_paste(
         )
     if max_attempts < 1:
         raise ValueError(f"max_attempts must be positive, got {max_attempts}")
+    if placement_mode not in ("random", "nearest"):
+        raise ValueError(
+            "placement_mode must be 'random' or 'nearest', got "
+            f"{placement_mode!r}"
+        )
 
     empty_paste_box = image.new_zeros(4)
     _, height, width = image.shape
@@ -107,6 +115,11 @@ def apply_same_class_distractor_copy_paste(
             )
 
     paste_x0 = paste_y0 = None
+    best_distance = None
+    target_center_x = 0.5 * (target_x0 + target_x1)
+    target_center_y = 0.5 * (target_y0 + target_y1)
+    distance_scale_x = max(float(target_width + paste_width), 1.0)
+    distance_scale_y = max(float(target_height + paste_height), 1.0)
     for _ in range(max_attempts):
         candidate_x0 = int(
             torch.randint(
@@ -136,8 +149,20 @@ def apply_same_class_distractor_copy_paste(
             ].any()
         ):
             continue
-        paste_x0, paste_y0 = candidate_x0, candidate_y0
-        break
+        if placement_mode == "random":
+            paste_x0, paste_y0 = candidate_x0, candidate_y0
+            break
+
+        candidate_center_x = candidate_x0 + 0.5 * paste_width
+        candidate_center_y = candidate_y0 + 0.5 * paste_height
+        normalized_distance = (
+            (candidate_center_x - target_center_x) / distance_scale_x
+        ) ** 2 + (
+            (candidate_center_y - target_center_y) / distance_scale_y
+        ) ** 2
+        if best_distance is None or normalized_distance < best_distance:
+            best_distance = normalized_distance
+            paste_x0, paste_y0 = candidate_x0, candidate_y0
 
     if paste_x0 is None or paste_y0 is None:
         return image.clone(), False, empty_paste_box

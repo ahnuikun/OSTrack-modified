@@ -796,3 +796,47 @@ experiments/ostrack/vitb_256_mae_ce_vdrm_v5_ahncp_32x4_ep300.yaml
 - `VDRM/alpha` 与 V3 的演化是否同量级，防止无关结构变化。
 
 上述诊断只判断实现和优化过程，不能代替完整数据集效果对比。V5 不允许根据单个测试数据集另设阈值或参数。
+
+## Change-20260730-01
+
+- Proposed change: 放弃 V5-AHNCP 作为下一版起点，完整回到 V3-HNCP；只把 HNCP 的粘贴位置由“24 次候选中的首个有效位置”改为“同一组 24 次候选中距离真实目标最近的有效位置”。
+- Reason: V5 虽然修正了粘贴位置与排序监督的坐标对齐，但训练后粘贴干扰已变成过于容易的负样本，削弱了 V3 原有的全背景最强负样本监督。下一步应提高 HNCP 数据本身的困难度，而不是继续改变损失、门控、可靠性或残差结构。
+- Evidence: V5 末期目标与粘贴干扰的响应差约为 `12.77`，且 V5/V3 的排序损失比值约为 `0.144/0.182=0.791`，与未应用 HNCP 的样本比例 `1-0.208=0.792` 基本一致。这说明 V5 中已应用 HNCP 的样本几乎不再贡献排序梯度。V5 相对重训 OSTrack 的 AUC 在 UAV123、DTB70 分别为 `+0.15`、`+0.45`，但仍未同时达到预设的 `+0.3~0.5` 改善目标。
+- Controlled variable: 固定 `DATA.SEARCH.VDRM_DISTRACTOR_PLACEMENT=nearest`。对每个满足“不覆盖真实目标且不进入无效填充区”的候选框，计算
+  \[
+  d^2=\left(\frac{x_d-x_t}{w_t+w_d}\right)^2+\left(\frac{y_d-y_t}{h_t+h_d}\right)^2,
+  \]
+  并选择 `d²` 最小者；候选次数、尺寸范围、应用概率及所有有效性条件保持 V3 不变。
+- Loss and network: 使用 V3 的全背景最高响应 `L_rank`，明确设置 `TRAIN.VDRM_ALIGN_DISTRACTOR_RANK=False`；VDRM 网络、Top-4 可靠性、零初始化残差、两个辅助损失及其 warm-up 均不改变。
+- Observability: 新增只读日志 `VDRM/distractor_hard_hit_rate` 与 `VDRM/distractor_global_gap`。前者表示全局最强背景响应是否落在粘贴框内，后者表示全局最强背景响应减去粘贴框内最强响应；两者不参与前向决策、损失或加权。
+- Compatibility: 默认放置模式仍为 `random`，默认困难度日志关闭；V1 至 V5 的已有配置、checkpoint 和训练行为不变。
+- Does it change a locked item: no。四训练数据集及比例、60000 samples/epoch、300 epoch、epoch 240 降学习率、学习率、CE 位置、Block 6 插入、batch size、损失权重和 checkpoint 策略全部不变。
+- Required comparison: 同协议比较重训 OSTrack、V3-HNCP、V5-AHNCP 和 V6-Near-HNCP。预注册成功标准为 UAV123 AUC 至少 `68.57`、DTB70 AUC 至少 `66.86`，即两者均比重训 OSTrack 至少提高 `0.30`；不得根据单个测试集修改参数。
+- Decision: approved。用户于 2026-07-30 明确要求实施“V3 + 近目标 HNCP”。
+
+## 17. VDRM-v6-Near-HNCP 设计与执行入口
+
+V6 是 V3 的单变量数据增强版本：
+
+1. HNCP 来源、概率、尺寸范围、候选次数与 V3 完全一致；
+2. 仍禁止粘贴框覆盖真实目标或落入搜索图无效填充区；
+3. 只在已有有效候选中选择离真实目标最近的位置；
+4. 排序损失仍选取全背景最高错误响应，不使用 V5 的粘贴框对齐负样本；
+5. 不增加可学习参数、margin、门控、质量头、可靠性分支或推理逻辑。
+
+配置：
+
+```text
+experiments/ostrack/vitb_256_mae_ce_vdrm_v6_near_hncp_32x4_ep300.yaml
+```
+
+固定随机种子的 100 组几何探针中，近目标选择将归一化中心距离均值从 `0.7295` 降至 `0.5482`，下降 `24.9%`，且 100 组均不比原首个有效候选更远。该结果只证明放置策略按设计生效，不代表跟踪精度一定提高。
+
+训练日志必须保留：
+
+- `VDRM/distractor_applied_rate`；
+- `VDRM/distractor_hard_hit_rate`；
+- `VDRM/distractor_global_gap`；
+- `Loss/vdrm_rank`、`VDRM/alpha` 与 `VDRM/reliability`。
+
+`distractor_hard_hit_rate` 越高、`distractor_global_gap` 越低，只表示粘贴干扰更可能成为全局硬负样本，不能代替五数据集最终测试。V6 不输出 V5 的 `alignment_success_rate`，因为本版明确恢复 V3 的全局负样本排序。

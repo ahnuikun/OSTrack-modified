@@ -119,6 +119,11 @@ def build_dataloaders(cfg, settings):
                                                            cfg.DATA.SEARCH,
                                                            "VDRM_DISTRACTOR_MAX_SCALE",
                                                            1.3,
+                                                       ),
+                                                       same_class_distractor_placement=getattr(
+                                                           cfg.DATA.SEARCH,
+                                                           "VDRM_DISTRACTOR_PLACEMENT",
+                                                           "random",
                                                        ))
 
     data_processing_val = processing.STARKProcessing(search_area_factor=search_area_factor,

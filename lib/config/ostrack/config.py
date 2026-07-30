@@ -75,6 +75,8 @@ cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS = 20
 # V5-only switch. When enabled, HNCP samples take the rank negative from the
 # pasted distractor box instead of an unrelated maximum over all background.
 cfg.TRAIN.VDRM_ALIGN_DISTRACTOR_RANK = False
+# Read-only V6 diagnostics; this never changes rank-negative selection.
+cfg.TRAIN.VDRM_LOG_DISTRACTOR_HARDNESS = False
 
 # TRAIN.SCHEDULER
 cfg.TRAIN.SCHEDULER = edict()
@@ -110,6 +112,7 @@ cfg.DATA.SEARCH.VDRM_OCCLUSION_MAX_RATIO = 0.5
 cfg.DATA.SEARCH.VDRM_DISTRACTOR_PROBABILITY = 0.0
 cfg.DATA.SEARCH.VDRM_DISTRACTOR_MIN_SCALE = 0.7
 cfg.DATA.SEARCH.VDRM_DISTRACTOR_MAX_SCALE = 1.3
+cfg.DATA.SEARCH.VDRM_DISTRACTOR_PLACEMENT = "random"
 # DATA.TEMPLATE
 cfg.DATA.TEMPLATE = edict()
 cfg.DATA.TEMPLATE.NUMBER = 1

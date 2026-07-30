@@ -52,6 +52,7 @@ class STARKProcessing(BaseProcessing):
                  mode='pair', settings=None,
                  same_class_distractor_min_scale=0.7,
                  same_class_distractor_max_scale=1.3,
+                 same_class_distractor_placement="random",
                  *args, **kwargs):
         """
         args:
@@ -82,6 +83,14 @@ class STARKProcessing(BaseProcessing):
         )
         self.same_class_distractor_max_scale = (
             same_class_distractor_max_scale
+        )
+        if same_class_distractor_placement not in ("random", "nearest"):
+            raise ValueError(
+                "same-class distractor placement must be 'random' or "
+                f"'nearest', got {same_class_distractor_placement!r}"
+            )
+        self.same_class_distractor_placement = (
+            same_class_distractor_placement
         )
 
     def _get_jittered_box(self, box, mode):
@@ -214,6 +223,7 @@ class STARKProcessing(BaseProcessing):
                         min_scale=self.same_class_distractor_min_scale,
                         max_scale=self.same_class_distractor_max_scale,
                         invalid_mask=data["search_att"][0],
+                        placement_mode=self.same_class_distractor_placement,
                     )
                 )
 

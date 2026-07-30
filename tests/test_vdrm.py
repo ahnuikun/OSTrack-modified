@@ -302,6 +302,32 @@ class VDRMTest(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, expected))
         self.assertEqual(diagnostics["alignment_success_rate"].item(), 0.0)
 
+    def test_distractor_diagnostics_do_not_replace_global_negative(self):
+        score_logits = torch.zeros(1, 4, 4)
+        score_logits[0, 1, 1] = 2.0
+        score_logits[0, 0, 0] = 1.0
+        score_logits[0, 3, 3] = 5.0
+        gaussian_map = torch.zeros_like(score_logits)
+        gaussian_map[0, 1, 1] = 1.0
+
+        loss, diagnostics = compute_vdrm_response_rank_loss(
+            score_logits,
+            gaussian_map,
+            distractor_boxes=torch.tensor(
+                [[0.00, 0.00, 0.25, 0.25]]
+            ),
+            distractor_applied=torch.tensor([1.0]),
+            align_distractor=False,
+        )
+
+        expected = torch.nn.functional.softplus(torch.tensor(5.0 - 2.0))
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertEqual(
+            diagnostics["distractor_hard_hit_rate"].item(), 0.0
+        )
+        self.assertEqual(diagnostics["distractor_global_gap"].item(), 4.0)
+        self.assertEqual(diagnostics["distractor_rank_margin"].item(), 1.0)
+
     def test_response_rank_maps_tiny_distractor_to_nearest_cell(self):
         score_logits = torch.zeros(1, 4, 4)
         score_logits[0, 2, 2] = 2.0
@@ -420,6 +446,60 @@ class VDRMTest(unittest.TestCase):
             or paste_y0 >= 40
         )
         self.assertFalse(overlaps_target)
+
+    def test_nearest_copy_paste_is_no_farther_than_random_placement(self):
+        image = torch.zeros(3, 64, 64)
+        distractor = torch.ones(3, 64, 64)
+        target_box = torch.tensor([0.375, 0.375, 0.25, 0.25])
+        distractor_box = torch.tensor([0.25, 0.25, 0.50, 0.50])
+        invalid_mask = torch.zeros(64, 64, dtype=torch.bool)
+
+        def normalized_center_distance(pasted_box):
+            target_center = target_box[:2] + 0.5 * target_box[2:]
+            pasted_center = pasted_box[:2] + 0.5 * pasted_box[2:]
+            scale = target_box[2:] + pasted_box[2:]
+            return (((pasted_center - target_center) / scale) ** 2).sum()
+
+        found_strict_improvement = False
+        for seed in range(8):
+            torch.manual_seed(seed)
+            _, random_applied, random_box = (
+                apply_same_class_distractor_copy_paste(
+                    image,
+                    target_box,
+                    distractor,
+                    distractor_box,
+                    min_scale=1.0,
+                    max_scale=1.0,
+                    invalid_mask=invalid_mask,
+                    placement_mode="random",
+                )
+            )
+            torch.manual_seed(seed)
+            _, nearest_applied, nearest_box = (
+                apply_same_class_distractor_copy_paste(
+                    image,
+                    target_box,
+                    distractor,
+                    distractor_box,
+                    min_scale=1.0,
+                    max_scale=1.0,
+                    invalid_mask=invalid_mask,
+                    placement_mode="nearest",
+                )
+            )
+
+            self.assertTrue(random_applied and nearest_applied)
+            random_distance = normalized_center_distance(random_box)
+            nearest_distance = normalized_center_distance(nearest_box)
+            self.assertLessEqual(
+                nearest_distance.item(), random_distance.item() + 1e-7
+            )
+            found_strict_improvement |= (
+                nearest_distance.item() + 1e-7 < random_distance.item()
+            )
+
+        self.assertTrue(found_strict_improvement)
 
 
 if __name__ == "__main__":

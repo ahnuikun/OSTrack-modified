@@ -105,8 +105,10 @@ def main():
         # Epoch 10 activates both auxiliary losses at a non-zero warm-up weight.
         "epoch": 10,
     }
-    if bool(getattr(cfg.TRAIN, "VDRM_ALIGN_DISTRACTOR_RANK", False)):
-        # Exercise the V5 metadata path without requiring local datasets. The
+    if bool(getattr(cfg.TRAIN, "VDRM_ALIGN_DISTRACTOR_RANK", False)) or bool(
+        getattr(cfg.TRAIN, "VDRM_LOG_DISTRACTOR_HARDNESS", False)
+    ):
+        # Exercise V5/V6 metadata paths without requiring local datasets. The
         # synthetic distractor box is disjoint from the labelled target.
         data["vdrm_distractor_applied"] = torch.ones(
             1, 1, device=device

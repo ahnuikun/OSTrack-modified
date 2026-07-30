@@ -116,12 +116,15 @@ def compute_vdrm_response_rank_loss(
     gaussian_map,
     distractor_boxes=None,
     distractor_applied=None,
+    align_distractor=True,
 ):
     """Rank the target response above a hard background response.
 
     The original V1/V3 behavior uses the maximum response over all background
-    cells. When HNCP metadata is supplied, an applied sample instead uses the
-    maximum response whose cell center lies inside the pasted distractor box.
+    cells. When HNCP metadata is supplied and ``align_distractor`` is true, an
+    applied sample instead uses the maximum response whose cell center lies
+    inside the pasted distractor box. With alignment disabled, the metadata is
+    used only for read-only hardness diagnostics and the V3 loss is unchanged.
     A very small valid paste that contains no cell center is represented by the
     closest background cell, so the supervision is not silently discarded.
     """
@@ -150,11 +153,17 @@ def compute_vdrm_response_rank_loss(
     global_negative_logit = score_logits.masked_fill(
         ~negative_mask, -torch.inf
     ).flatten(1).amax(dim=1)
+    global_negative_index = score_logits.masked_fill(
+        ~negative_mask, -torch.inf
+    ).flatten(1).argmax(dim=1, keepdim=True)
     selected_negative_logit = global_negative_logit
     aligned_mask = torch.zeros(
         batch_size, device=score_logits.device, dtype=torch.bool
     )
     applied_mask = torch.zeros_like(aligned_mask)
+    distractor_global_gap = score_logits.new_zeros(())
+    distractor_hard_hit_rate = score_logits.new_zeros(())
+    distractor_rank_margin = score_logits.new_zeros(())
 
     if distractor_boxes is not None and distractor_applied is not None:
         boxes = distractor_boxes.to(
@@ -221,11 +230,28 @@ def compute_vdrm_response_rank_loss(
         distractor_negative_logit = score_logits.masked_fill(
             ~distractor_negative_mask, -torch.inf
         ).flatten(1).amax(dim=1)
-        selected_negative_logit = torch.where(
-            aligned_mask,
-            distractor_negative_logit,
-            global_negative_logit,
-        )
+        if align_distractor:
+            selected_negative_logit = torch.where(
+                aligned_mask,
+                distractor_negative_logit,
+                global_negative_logit,
+            )
+
+        if aligned_mask.any():
+            hard_hit = distractor_negative_mask.flatten(1).gather(
+                dim=1, index=global_negative_index
+            ).squeeze(1)
+            distractor_hard_hit_rate = (
+                hard_hit[aligned_mask].float().mean()
+            )
+            distractor_global_gap = (
+                global_negative_logit[aligned_mask]
+                - distractor_negative_logit[aligned_mask]
+            ).mean()
+            distractor_rank_margin = (
+                positive_logit[aligned_mask]
+                - distractor_negative_logit[aligned_mask]
+            ).mean()
 
     if has_negative.any():
         rank_loss = F.softplus(
@@ -239,16 +265,11 @@ def compute_vdrm_response_rank_loss(
     alignment_success_rate = (
         aligned_mask.float().sum() / applied_count.clamp_min(1.0)
     )
-    if aligned_mask.any():
-        distractor_rank_margin = (
-            positive_logit[aligned_mask]
-            - selected_negative_logit[aligned_mask]
-        ).mean()
-    else:
-        distractor_rank_margin = score_logits.new_zeros(())
     diagnostics = {
         "alignment_success_rate": alignment_success_rate,
         "distractor_rank_margin": distractor_rank_margin,
+        "distractor_hard_hit_rate": distractor_hard_hit_rate,
+        "distractor_global_gap": distractor_global_gap,
     }
     return rank_loss, diagnostics
 
@@ -438,9 +459,16 @@ class OSTrackActor(BaseActor):
                         False,
                     )
                 )
+                log_distractor_hardness = bool(
+                    getattr(
+                        self.cfg.TRAIN,
+                        'VDRM_LOG_DISTRACTOR_HARDNESS',
+                        False,
+                    )
+                )
                 distractor_boxes = None
                 distractor_applied = None
-                if align_distractor_rank:
+                if align_distractor_rank or log_distractor_hardness:
                     distractor_boxes = gt_dict.get('vdrm_distractor_box')
                     distractor_applied = gt_dict.get(
                         'vdrm_distractor_applied'
@@ -451,6 +479,7 @@ class OSTrackActor(BaseActor):
                         gaussian_map,
                         distractor_boxes=distractor_boxes,
                         distractor_applied=distractor_applied,
+                        align_distractor=align_distractor_rank,
                     )
                 )
 
@@ -511,6 +540,25 @@ class OSTrackActor(BaseActor):
                         ),
                         "VDRM/distractor_rank_margin": (
                             rank_diagnostics["distractor_rank_margin"]
+                            .detach()
+                            .item()
+                        ),
+                    })
+                if rank_diagnostics is not None and bool(
+                    getattr(
+                        self.cfg.TRAIN,
+                        'VDRM_LOG_DISTRACTOR_HARDNESS',
+                        False,
+                    )
+                ):
+                    status.update({
+                        "VDRM/distractor_hard_hit_rate": (
+                            rank_diagnostics["distractor_hard_hit_rate"]
+                            .detach()
+                            .item()
+                        ),
+                        "VDRM/distractor_global_gap": (
+                            rank_diagnostics["distractor_global_gap"]
                             .detach()
                             .item()
                         ),
