@@ -13,6 +13,19 @@ EPS = 1e-12
 CORRECT_IOU_THRESHOLD = 0.5
 FAILURE_IOU_THRESHOLD = 0.1
 PAIR_DELTA_THRESHOLD = 0.05
+RESIDUAL_METRICS = (
+    "residual_active_token_fraction",
+    "residual_relative_norm_mean",
+    "residual_relative_norm_p50",
+    "residual_relative_norm_p90",
+    "residual_relative_norm_p99",
+    "residual_relative_norm_max",
+    "residual_top10_energy_fraction",
+    "residual_spatial_entropy_normalized",
+    "vdrm_residual_clip_rate",
+    "vdrm_raw_delta_relative_norm",
+    "vdrm_delta_relative_norm",
+)
 
 
 def valid_box(box: Sequence[float]) -> bool:
@@ -331,6 +344,40 @@ def reliability_summary(
     }
 
 
+def continuous_metric_summary(
+    rows: Sequence[Mapping[str, object]], metric: str
+) -> Dict[str, Optional[float]]:
+    """Relate a continuous diagnostic metric to VDRM tracking quality."""
+    valid_rows = []
+    for row in rows:
+        try:
+            value = float(row.get(metric, math.nan))
+            iou = float(row.get("vdrm_iou", math.nan))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and math.isfinite(iou):
+            valid_rows.append((row, value, iou))
+
+    values = [value for _, value, _ in valid_rows]
+    ious = [iou for _, _, iou in valid_rows]
+    correct_values = [
+        value
+        for row, value, _ in valid_rows
+        if row.get("vdrm_status") == "correct"
+    ]
+    failed_values = [
+        value
+        for row, value, _ in valid_rows
+        if row.get("vdrm_status") == "failed"
+    ]
+    return {
+        "mean": _mean(values),
+        "correct_mean": _mean(correct_values),
+        "failed_mean": _mean(failed_values),
+        "spearman_with_vdrm_iou": spearman(values, ious),
+    }
+
+
 def summarize_pair_rows(
     rows: Sequence[Mapping[str, object]],
 ) -> Dict[str, object]:
@@ -345,7 +392,11 @@ def summarize_pair_rows(
         "vdrm_response_reliability",
         "combined_reliability",
     )
-    return {
+    residual = {
+        metric: continuous_metric_summary(valid_rows, metric)
+        for metric in RESIDUAL_METRICS
+    }
+    summary = {
         "frame_count": len(rows),
         "valid_gt_frames": len(valid_rows),
         "baseline_mean_iou": _mean(
@@ -406,4 +457,8 @@ def summarize_pair_rows(
             metric: reliability_summary(valid_rows, metric)
             for metric in metric_names
         },
+        "residual": residual,
     }
+    for metric, metric_summary in residual.items():
+        summary[f"mean_{metric}"] = metric_summary["mean"]
+    return summary
