@@ -867,3 +867,31 @@ output/vdrm_paired_hncp_diagnostics/vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300/
 ```
 
 该工具的 CSV 保留全部逐样本值，JSON 提供总体及按训练数据集分组的均值。任何 V7 方案必须先引用这两个文件中的配对差值，不允许只凭几何距离或单个测试序列立项。
+
+## Change-20260801-02
+
+- Proposed change: 在 V3 与冻结 M2 的 No-Link 对照补齐期间，新增只读的 OSTrack/V3 Backend 开环配对诊断，不修改任何模型、训练配置或标准推理路径。
+- Reason: 联合结果同时混合了 V3 单帧视觉输出变化、M2 闭环搜索区域反馈和 V3 可靠度决策影响。仅比较两个独立 Tracker 的轨迹无法定位差异从哪一帧、哪一个输出维度开始，因为两者从第二帧起可能使用不同搜索裁剪。
+- Diagnostic control: 每帧只根据统一 anchor 生成一次模板/搜索张量，再将同一张量分别送入重训 OSTrack 与 V3。`baseline_replay` 使用重训 OSTrack 输出作为下一帧 anchor，V3 输出永不影响后续裁剪；`ground_truth` 使用上一帧有效 GT 作为 anchor。M2、Kalman、相机补偿和可靠度门控均不参与。
+- Outputs: 逐帧保存两 Backend 的框、IoU、中心误差、宽高对数比、响应第一/第二峰、熵、响应峰位移、V3 部件可靠度、三种视觉可靠度以及 VDRM 残差空间分布；通过“V3 中心＋OSTrack 尺度”和“OSTrack 中心＋V3 尺度”混合框分离中心与尺度影响。
+- Decision rule: 若相同裁剪下 V3 已下降且 No-Link 同时下降，后续只允许修改 VDRM 残差结构；若相同裁剪下视觉框正常但可靠度判别能力差，后续只允许修改可靠度输出；若开环正常而 No-Link 下降，则归因为闭环放大，不能误写成单帧视觉表征失败。
+- Does it change a locked item: no。V1 至 V6 的网络、损失、训练数据、checkpoint、测试配置和已有输出完全不变。
+- Decision: approved。用户于 2026-08-01 要求实现服务器侧 Backend 配对诊断并上传 GitHub。
+
+## 19. Backend 开环配对诊断入口
+
+工具及说明：
+
+```text
+tracking/vdrm_diagnostics/diagnose_vdrm_backend_pairs.py
+tracking/vdrm_diagnostics/README.md
+```
+
+默认比较重训 OSTrack `vitb_256_mae_ce_32x4_ep300_fulltn` 与 V3-HNCP epoch-300。工具要求显式给出数据集和序列，避免无意运行完整正式测试集。默认输出到：
+
+```text
+output/vdrm_backend_pairs/
+  <baseline>__vs__<vdrm>/<dataset>/<anchor_mode>/
+```
+
+所有输出只用于根因诊断，不能替代标准 Tracker 的 AUC、Precision 和 Normalized Precision 结果。

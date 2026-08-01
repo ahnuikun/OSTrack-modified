@@ -1,0 +1,157 @@
+import math
+import unittest
+
+import torch
+
+from tracking.vdrm_diagnostics.backend_pair_metrics import (
+    bbox_iou_xywh,
+    binary_auc,
+    mix_box,
+    pair_status,
+    residual_spatial_statistics,
+    response_statistics,
+    summarize_pair_rows,
+)
+from tracking.vdrm_diagnostics.diagnose_vdrm_backend_pairs import (
+    assert_backend_compatibility,
+    load_config,
+    map_box_back_from_anchor,
+)
+
+
+class VDRMBackendPairMetricsTest(unittest.TestCase):
+    def test_registered_configs_are_isolated_and_pair_compatible(self):
+        _, _, baseline = load_config(
+            "vitb_256_mae_ce_32x4_ep300_fulltn"
+        )
+        _, _, vdrm = load_config(
+            "vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300"
+        )
+
+        assert_backend_compatibility(baseline, vdrm)
+        self.assertFalse(baseline.MODEL.VDRM.ENABLED)
+        self.assertTrue(vdrm.MODEL.VDRM.ENABLED)
+        self.assertIsNot(baseline, vdrm)
+        self.assertIsNot(baseline.MODEL, vdrm.MODEL)
+
+    def test_map_box_back_uses_the_shared_anchor(self):
+        mapped = map_box_back_from_anchor(
+            predicted_box=[50.0, 50.0, 20.0, 10.0],
+            anchor_bbox=[40.0, 30.0, 20.0, 20.0],
+            search_size=100.0,
+            resize_factor=1.0,
+        )
+
+        self.assertEqual(mapped, [40.0, 35.0, 20.0, 10.0])
+
+    def test_mixed_boxes_separate_center_and_size(self):
+        baseline = [0.0, 0.0, 4.0, 4.0]
+        vdrm = [1.0, 1.0, 2.0, 2.0]
+
+        vdrm_center_baseline_size = mix_box(vdrm, baseline)
+        baseline_center_vdrm_size = mix_box(baseline, vdrm)
+
+        self.assertEqual(vdrm_center_baseline_size, [0.0, 0.0, 4.0, 4.0])
+        self.assertEqual(baseline_center_vdrm_size, [1.0, 1.0, 2.0, 2.0])
+        self.assertEqual(bbox_iou_xywh(baseline, baseline), 1.0)
+
+    def test_response_statistics_suppress_first_peak_neighborhood(self):
+        response = torch.zeros(3, 3)
+        response[0, 0] = 0.9
+        response[0, 1] = 0.8
+        response[2, 2] = 0.45
+
+        metrics = response_statistics(response, nms_radius=1)
+
+        self.assertAlmostEqual(metrics["p1"], 0.9, places=6)
+        self.assertAlmostEqual(metrics["p2"], 0.45, places=6)
+        self.assertEqual((metrics["p1_x"], metrics["p1_y"]), (0, 0))
+        self.assertEqual((metrics["p2_x"], metrics["p2_y"]), (2, 2))
+        self.assertGreaterEqual(metrics["entropy_normalized"], 0.0)
+        self.assertLessEqual(metrics["entropy_normalized"], 1.0)
+
+    def test_residual_statistics_measure_spatial_concentration(self):
+        input_tokens = torch.ones(1, 6, 4)
+        output_tokens = input_tokens.clone()
+        output_tokens[:, 2, :] += 1.0
+
+        metrics = residual_spatial_statistics(
+            input_tokens, output_tokens, template_length=2
+        )
+
+        self.assertAlmostEqual(
+            metrics["residual_active_token_fraction"], 0.25
+        )
+        self.assertAlmostEqual(
+            metrics["residual_top10_energy_fraction"], 1.0
+        )
+        self.assertAlmostEqual(
+            metrics["residual_spatial_entropy_normalized"], 0.0
+        )
+        self.assertGreater(metrics["residual_relative_norm_max"], 0.0)
+
+    def test_pair_status_uses_registered_delta_threshold(self):
+        self.assertEqual(pair_status(0.06), "vdrm_better")
+        self.assertEqual(pair_status(-0.06), "vdrm_worse")
+        self.assertEqual(pair_status(0.01), "similar")
+        self.assertEqual(pair_status(math.nan), "invalid_gt")
+
+    def test_binary_auc_rewards_correct_reliability_order(self):
+        self.assertEqual(binary_auc([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0]), 1.0)
+        self.assertEqual(binary_auc([0.1, 0.2, 0.8, 0.9], [1, 1, 0, 0]), 0.0)
+
+    def test_summary_compares_raw_response_and_combined_reliability(self):
+        rows = []
+        for index, (delta, iou, reliability) in enumerate(
+            [
+                (0.20, 0.80, 0.90),
+                (0.10, 0.70, 0.80),
+                (-0.10, 0.05, 0.20),
+                (-0.20, 0.02, 0.10),
+            ]
+        ):
+            rows.append(
+                {
+                    "frame_index": index,
+                    "baseline_iou": iou - delta,
+                    "vdrm_iou": iou,
+                    "delta_iou": delta,
+                    "vdrm_status": "correct" if iou >= 0.5 else "failed",
+                    "pair_status": pair_status(delta),
+                    "center_only_delta_iou": 0.5 * delta,
+                    "size_only_delta_iou": 0.25 * delta,
+                    "backend_center_shift_normalized": abs(delta),
+                    "log_width_ratio": delta,
+                    "log_height_ratio": delta,
+                    "response_peak_shift_normalized": abs(delta),
+                    "residual_active_token_fraction": 1.0,
+                    "residual_spatial_entropy_normalized": 0.9,
+                    "visual_reliability": reliability,
+                    "vdrm_response_reliability": reliability,
+                    "combined_reliability": reliability,
+                }
+            )
+
+        summary = summarize_pair_rows(rows)
+
+        self.assertEqual(summary["vdrm_better_frames"], 2)
+        self.assertEqual(summary["vdrm_worse_frames"], 2)
+        for metric in (
+            "visual_reliability",
+            "vdrm_response_reliability",
+            "combined_reliability",
+        ):
+            self.assertEqual(
+                summary["reliability"][metric]["correct_vs_failed_auc"],
+                1.0,
+            )
+            self.assertEqual(
+                summary["reliability"][metric][
+                    "vdrm_better_vs_worse_auc"
+                ],
+                1.0,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
