@@ -53,6 +53,7 @@ class STARKProcessing(BaseProcessing):
                  same_class_distractor_min_scale=0.7,
                  same_class_distractor_max_scale=1.3,
                  same_class_distractor_placement="random",
+                 return_vdrm_diagnostic_inputs=False,
                  *args, **kwargs):
         """
         args:
@@ -91,6 +92,9 @@ class STARKProcessing(BaseProcessing):
             )
         self.same_class_distractor_placement = (
             same_class_distractor_placement
+        )
+        self.return_vdrm_diagnostic_inputs = bool(
+            return_vdrm_diagnostic_inputs
         )
 
     def _get_jittered_box(self, box, mode):
@@ -186,6 +190,18 @@ class STARKProcessing(BaseProcessing):
 
         distractor_applied = False
         pasted_distractor_box = data["search_images"][0].new_zeros(4)
+        if self.return_vdrm_diagnostic_inputs:
+            data["vdrm_diagnostic_distractor_available"] = (
+                data["search_images"][0].new_zeros(1)
+            )
+            data["vdrm_diagnostic_distractor_image"] = (
+                data["search_images"][0].new_zeros(
+                    1, *data["search_images"][0].shape
+                )
+            )
+            data["vdrm_diagnostic_distractor_box"] = (
+                data["search_images"][0].new_zeros(1, 4)
+            )
         if has_distractor:
             distractor_crops, distractor_boxes, distractor_att, distractor_mask_crops = (
                 prutils.jittered_center_crop(
@@ -210,22 +226,31 @@ class STARKProcessing(BaseProcessing):
                 joint=False,
             )
             if not transformed_distractor_att[0].all():
-                (
-                    data["search_images"][0],
-                    distractor_applied,
-                    pasted_distractor_box,
-                ) = (
-                    apply_same_class_distractor_copy_paste(
-                        data["search_images"][0],
-                        data["search_anno"][0],
-                        transformed_distractor[0],
-                        transformed_distractor_box[0],
-                        min_scale=self.same_class_distractor_min_scale,
-                        max_scale=self.same_class_distractor_max_scale,
-                        invalid_mask=data["search_att"][0],
-                        placement_mode=self.same_class_distractor_placement,
+                if self.return_vdrm_diagnostic_inputs:
+                    data["vdrm_diagnostic_distractor_available"].fill_(1.0)
+                    data["vdrm_diagnostic_distractor_image"][0].copy_(
+                        transformed_distractor[0]
                     )
-                )
+                    data["vdrm_diagnostic_distractor_box"][0].copy_(
+                        transformed_distractor_box[0]
+                    )
+                else:
+                    (
+                        data["search_images"][0],
+                        distractor_applied,
+                        pasted_distractor_box,
+                    ) = (
+                        apply_same_class_distractor_copy_paste(
+                            data["search_images"][0],
+                            data["search_anno"][0],
+                            transformed_distractor[0],
+                            transformed_distractor_box[0],
+                            min_scale=self.same_class_distractor_min_scale,
+                            max_scale=self.same_class_distractor_max_scale,
+                            invalid_mask=data["search_att"][0],
+                            placement_mode=self.same_class_distractor_placement,
+                        )
+                    )
 
         data["vdrm_distractor_applied"] = torch.tensor(
             [float(distractor_applied)], dtype=torch.float32

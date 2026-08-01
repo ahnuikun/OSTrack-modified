@@ -840,3 +840,30 @@ experiments/ostrack/vitb_256_mae_ce_vdrm_v6_near_hncp_32x4_ep300.yaml
 - `Loss/vdrm_rank`、`VDRM/alpha` 与 `VDRM/reliability`。
 
 `distractor_hard_hit_rate` 越高、`distractor_global_gap` 越低，只表示粘贴干扰更可能成为全局硬负样本，不能代替五数据集最终测试。V6 不输出 V5 的 `alignment_success_rate`，因为本版明确恢复 V3 的全局负样本排序。
+
+## Change-20260801-01
+
+- Proposed change: 暂停 V7 设计；先实现一个只读的 HNCP 配对响应诊断工具，使用同一个 V3 checkpoint、同一训练样本、同一干扰实例、同一缩放和同一候选序列，比较无粘贴、V3 首个有效随机位置和最近有效位置三次前向。
+- Reason: V6 相对 V5 在五个测试集全部下降，但训练损失、验证 IoU 和 `alpha` 均正常。必须先区分近目标粘贴是提高了真实响应困难度、损伤了目标证据，还是训练后仍成为容易负样本，不能仅根据最终 AUC 继续猜测 V7 结构。
+- Evidence: V6 的 `distractor_hard_hit_rate` 从 epoch 1 的约 `0.210` 降至 epoch 300 的约 `0.018`，`distractor_global_gap` 从约 `0.71` 增至约 `4.06`；V6 相对 V5 的 VisDrone、UAV123、UAVDT、DTB70、LaSOT AUC 变化为 `-1.10/-0.01/-1.24/-0.73/-0.48`。逐序列结果同时存在数十分的正负分叉，说明仅凭空间距离不能解释身份锁定变化。
+- Diagnostic control: 数据处理只在显式诊断模式下返回干净搜索图和已变换的干扰源，不执行 HNCP；工具保存 CPU Torch RNG 状态，先生成 V3 随机版本，再恢复相同状态生成最近版本，保证两者使用完全相同的缩放和候选序列。模型处于 `eval`、`no_grad` 状态，checkpoint 严格只读。
+- Outputs: 每个样本记录目标 logit/score、全局背景 logit/score、粘贴位置 logit/score、hard-hit、global gap、rank margin、预测 IoU、中心误差与视觉可靠性；输出 `paired_samples.csv` 和总计/分数据集 `summary.json`。
+- Decision rule: 最近位置只有在相对随机位置提高粘贴响应或 hard-hit、降低 global gap，同时不持续降低目标 logit、rank margin 和预测 IoU时，才可作为后续方向；否则淘汰位置控制。该诊断不产生新的训练超参数，也不能直接作为最终效果结论。
+- Does it change a locked item: no。网络、损失、训练 YAML、数据集、采样比例、训练轮数、学习率、checkpoint 和标准推理路径均不变；诊断字段默认关闭，不影响 V1 至 V6 复现。
+- Decision: approved。用户于 2026-08-01 要求先实现配对诊断，再根据真实响应证据决定是否需要 V7。
+
+## 18. HNCP 配对响应诊断入口
+
+工具：
+
+```text
+tracking/diagnose_vdrm_hncp_pairs.py
+```
+
+默认使用 V3 配置和 V3 epoch-300 checkpoint。工具运行时临时将同类干扰源采样概率设为 `1.0`，仅用于提高诊断样本收集效率；训练配置文件和原有增强概率不被修改。输出默认位于：
+
+```text
+output/vdrm_paired_hncp_diagnostics/vitb_256_mae_ce_vdrm_v3_hncp_32x4_ep300/
+```
+
+该工具的 CSV 保留全部逐样本值，JSON 提供总体及按训练数据集分组的均值。任何 V7 方案必须先引用这两个文件中的配对差值，不允许只凭几何距离或单个测试序列立项。

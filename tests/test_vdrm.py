@@ -13,6 +13,11 @@ from lib.train.data.vdrm_augmentation import (
     apply_same_class_distractor_copy_paste,
     apply_structured_target_occlusion,
 )
+from lib.train.data.vdrm_paired_diagnostics import (
+    compute_condition_metrics,
+    create_paired_copy_pastes,
+    normalized_center_distance,
+)
 
 
 class VDRMTest(unittest.TestCase):
@@ -500,6 +505,97 @@ class VDRMTest(unittest.TestCase):
             )
 
         self.assertTrue(found_strict_improvement)
+
+    def test_paired_copy_paste_reuses_scale_and_candidate_sequence(self):
+        image = torch.zeros(3, 64, 64)
+        distractor = torch.ones(3, 64, 64)
+        target_box = torch.tensor([0.375, 0.375, 0.25, 0.25])
+        source_box = torch.tensor([0.25, 0.25, 0.50, 0.50])
+        invalid_mask = torch.zeros(64, 64, dtype=torch.bool)
+
+        torch.manual_seed(19)
+        (
+            random_image,
+            near_image,
+            random_applied,
+            near_applied,
+            random_box,
+            near_box,
+        ) = create_paired_copy_pastes(
+            image,
+            target_box,
+            distractor,
+            source_box,
+            invalid_mask,
+            min_scale=0.7,
+            max_scale=1.3,
+        )
+
+        torch.manual_seed(19)
+        expected_random = apply_same_class_distractor_copy_paste(
+            image,
+            target_box,
+            distractor,
+            source_box,
+            min_scale=0.7,
+            max_scale=1.3,
+            invalid_mask=invalid_mask,
+            placement_mode="random",
+        )
+        torch.manual_seed(19)
+        expected_near = apply_same_class_distractor_copy_paste(
+            image,
+            target_box,
+            distractor,
+            source_box,
+            min_scale=0.7,
+            max_scale=1.3,
+            invalid_mask=invalid_mask,
+            placement_mode="nearest",
+        )
+
+        self.assertTrue(random_applied and near_applied)
+        self.assertTrue(expected_random[1] and expected_near[1])
+        self.assertTrue(torch.equal(random_image, expected_random[0]))
+        self.assertTrue(torch.equal(near_image, expected_near[0]))
+        self.assertTrue(torch.equal(random_box, expected_random[2]))
+        self.assertTrue(torch.equal(near_box, expected_near[2]))
+        self.assertTrue(torch.equal(random_box[2:], near_box[2:]))
+        self.assertLessEqual(
+            normalized_center_distance(target_box, near_box).item(),
+            normalized_center_distance(target_box, random_box).item(),
+        )
+
+    def test_paired_response_metrics_report_paste_hard_hit(self):
+        logits = torch.zeros(1, 1, 4, 4)
+        logits[0, 0, 2, 2] = 4.0
+        logits[0, 0, 0, 0] = 5.0
+        score_map = logits.sigmoid()
+        output = {
+            "score_logits": logits,
+            "score_map": score_map,
+            "pred_boxes": torch.tensor(
+                [[[0.375, 0.375, 0.25, 0.25]]]
+            ),
+            "visual_reliability": torch.tensor([0.8]),
+        }
+        target_box = torch.tensor([[0.25, 0.25, 0.25, 0.25]])
+        paste_box = torch.tensor([[0.0, 0.0, 0.25, 0.25]])
+
+        metrics = compute_condition_metrics(
+            output,
+            target_box,
+            search_size=64,
+            stride=16,
+            distractor_boxes=paste_box,
+        )
+
+        self.assertEqual(metrics["target_logit"].item(), 4.0)
+        self.assertEqual(metrics["global_negative_logit"].item(), 5.0)
+        self.assertEqual(metrics["paste_logit"].item(), 5.0)
+        self.assertEqual(metrics["paste_global_gap"].item(), 0.0)
+        self.assertEqual(metrics["paste_hard_hit"].item(), 1.0)
+        self.assertAlmostEqual(metrics["pred_iou"].item(), 1.0)
 
 
 if __name__ == "__main__":
