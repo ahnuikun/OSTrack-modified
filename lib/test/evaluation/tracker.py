@@ -11,17 +11,29 @@ import numpy as np
 
 
 def trackerlist(name: str, parameter_name: str, dataset_name: str, run_ids = None, display_name: str = None,
-                result_only=False):
+                result_only=False, checkpoint=None):
     """Generate list of trackers.
     args:
         name: Name of tracking method.
         parameter_name: Name of parameter file.
         run_ids: A single or list of run_ids.
         display_name: Name to be displayed in the result plots.
+        checkpoint: Optional checkpoint path overriding tracker parameters.
     """
     if run_ids is None or isinstance(run_ids, int):
         run_ids = [run_ids]
-    return [Tracker(name, parameter_name, dataset_name, run_id, display_name, result_only) for run_id in run_ids]
+    return [
+        Tracker(
+            name,
+            parameter_name,
+            dataset_name,
+            run_id,
+            display_name,
+            result_only,
+            checkpoint=checkpoint,
+        )
+        for run_id in run_ids
+    ]
 
 
 class Tracker:
@@ -31,10 +43,11 @@ class Tracker:
         parameter_name: Name of parameter file.
         run_id: The run id.
         display_name: Name to be displayed in the result plots.
+        checkpoint: Optional checkpoint path overriding tracker parameters.
     """
 
     def __init__(self, name: str, parameter_name: str, dataset_name: str, run_id: int = None, display_name: str = None,
-                 result_only=False):
+                 result_only=False, checkpoint=None):
         assert run_id is None or isinstance(run_id, int)
 
         self.name = name
@@ -42,6 +55,7 @@ class Tracker:
         self.dataset_name = dataset_name
         self.run_id = run_id
         self.display_name = display_name
+        self.checkpoint = checkpoint
 
         env = env_settings()
         if self.run_id is None:
@@ -276,6 +290,16 @@ class Tracker:
         """Get parameters."""
         param_module = importlib.import_module('lib.test.parameter.{}'.format(self.name))
         params = param_module.parameters(self.parameter_name)
+        if self.checkpoint is not None:
+            checkpoint = os.path.abspath(os.path.expanduser(self.checkpoint))
+            if not os.path.isfile(checkpoint):
+                raise FileNotFoundError(
+                    'Explicit checkpoint does not exist: {}'.format(
+                        checkpoint
+                    )
+                )
+            params.checkpoint = checkpoint
+            print('test checkpoint:', params.checkpoint)
         return params
 
     def _read_image(self, image_file: str):
@@ -286,6 +310,4 @@ class Tracker:
             return decode_img(image_file[0], image_file[1])
         else:
             raise ValueError("type of image_file should be str or list")
-
-
 

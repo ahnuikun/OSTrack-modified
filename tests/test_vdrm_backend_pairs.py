@@ -152,6 +152,17 @@ class VDRMBackendPairMetricsTest(unittest.TestCase):
                 1.0,
             )
 
+        residual = summary["residual"][
+            "residual_active_token_fraction"
+        ]
+        self.assertEqual(residual["mean"], 1.0)
+        self.assertEqual(residual["correct_mean"], 1.0)
+        self.assertEqual(residual["failed_mean"], 1.0)
+        self.assertIsNone(residual["spearman_with_vdrm_iou"])
+        self.assertEqual(
+            summary["mean_residual_active_token_fraction"], 1.0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

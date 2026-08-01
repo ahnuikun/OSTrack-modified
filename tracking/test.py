@@ -12,7 +12,7 @@ from lib.test.evaluation.tracker import Tracker
 
 
 def run_tracker(tracker_name, tracker_param, run_id=None, dataset_name='otb', sequence=None, debug=0, threads=0,
-                num_gpus=8):
+                num_gpus=8, checkpoint=None):
     """Run tracker on sequence or dataset.
     args:
         tracker_name: Name of tracking method.
@@ -29,7 +29,15 @@ def run_tracker(tracker_name, tracker_param, run_id=None, dataset_name='otb', se
     if sequence is not None:
         dataset = [dataset[sequence]]
 
-    trackers = [Tracker(tracker_name, tracker_param, dataset_name, run_id)]
+    trackers = [
+        Tracker(
+            tracker_name,
+            tracker_param,
+            dataset_name,
+            run_id,
+            checkpoint=checkpoint,
+        )
+    ]
 
     run_dataset(dataset, trackers, debug, threads, num_gpus=num_gpus)
 
@@ -44,6 +52,15 @@ def main():
     parser.add_argument('--debug', type=int, default=0, help='Debug level.')
     parser.add_argument('--threads', type=int, default=0, help='Number of threads.')
     parser.add_argument('--num_gpus', type=int, default=8)
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default=None,
+        help=(
+            'Explicit checkpoint path. Overrides the checkpoint derived '
+            'from the tracker configuration.'
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -53,7 +70,7 @@ def main():
         seq_name = args.sequence
 
     run_tracker(args.tracker_name, args.tracker_param, args.runid, args.dataset_name, seq_name, args.debug,
-                args.threads, num_gpus=args.num_gpus)
+                args.threads, num_gpus=args.num_gpus, checkpoint=args.checkpoint)
 
 
 if __name__ == '__main__':
