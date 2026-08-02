@@ -9,6 +9,8 @@ The first implementation intentionally keeps the design small:
   zero-initialized residual scalar;
 * VDRM-v4 can deterministically bound the complete residual update relative
   to each input search-token norm.
+* VDRM-v7 can require multiple template parts to agree inside one local
+  search candidate before allowing a spatial residual update.
 
 The original ``topk`` reliability is retained for VDRM-v1 checkpoint
 compatibility. VDRM-v2 uses the margin between a part's best match and its
@@ -39,6 +41,11 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         initial_match_scale: float = 5.0,
         initial_match_bias: float = -2.5,
         residual_max_ratio: float = 0.0,
+        spatial_gate_mode: str = "token_match",
+        candidate_local_radius: int = 1,
+        candidate_consensus_parts: int = 2,
+        candidate_initial_match_scale: float = 5.0,
+        candidate_initial_match_bias: float = -2.5,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -61,6 +68,21 @@ class VisibilityDrivenRepresentationModule(nn.Module):
                 "residual_max_ratio must be non-negative, got "
                 f"{residual_max_ratio}"
             )
+        if spatial_gate_mode not in ("token_match", "candidate_consensus"):
+            raise ValueError(
+                "spatial_gate_mode must be 'token_match' or "
+                f"'candidate_consensus', got {spatial_gate_mode!r}"
+            )
+        if candidate_local_radius < 0:
+            raise ValueError(
+                "candidate_local_radius must be non-negative, got "
+                f"{candidate_local_radius}"
+            )
+        if not 1 <= candidate_consensus_parts <= num_parts:
+            raise ValueError(
+                "candidate_consensus_parts must be in [1, num_parts], got "
+                f"{candidate_consensus_parts} for {num_parts} parts"
+            )
 
         self.num_parts = num_parts
         self.part_grid = part_grid
@@ -68,6 +90,9 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         self.reliability_mode = reliability_mode
         self.nms_radius = nms_radius
         self.residual_max_ratio = float(residual_max_ratio)
+        self.spatial_gate_mode = spatial_gate_mode
+        self.candidate_local_radius = int(candidate_local_radius)
+        self.candidate_consensus_parts = int(candidate_consensus_parts)
         self.eps = eps
 
         # A shared monotonic calibration is enough for the first version.
@@ -79,8 +104,130 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
         self.match_bias = nn.Parameter(torch.tensor(float(initial_match_bias)))
 
+        # Candidate calibration is instantiated only for V7. Keeping these
+        # parameters absent in the default mode preserves the exact V1-V6
+        # state-dict contract for existing checkpoints.
+        if self.spatial_gate_mode == "candidate_consensus":
+            initial_candidate_scale = torch.tensor(
+                float(candidate_initial_match_scale)
+            )
+            self.candidate_log_match_scale = nn.Parameter(
+                torch.log(torch.expm1(initial_candidate_scale))
+            )
+            self.candidate_match_bias = nn.Parameter(
+                torch.tensor(float(candidate_initial_match_bias))
+            )
+        else:
+            self.register_parameter("candidate_log_match_scale", None)
+            self.register_parameter("candidate_match_bias", None)
+
         # Zero initialization preserves the original OSTrack forward path.
         self.alpha = nn.Parameter(torch.zeros(()))
+
+    def _candidate_consensus_statistics(
+        self,
+        similarity: torch.Tensor,
+        part_reliability: torch.Tensor,
+        part_valid: torch.Tensor,
+        search_global_index: torch.Tensor,
+        search_grid_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a candidate-level reliability gate from local part agreement.
+
+        Each retained token is treated as a candidate location. For every
+        template part, the strongest positive match in a fixed local
+        neighbourhood is collected on the original search grid. The gate is
+        calibrated from the strongest ``candidate_consensus_parts`` part
+        matches, so one isolated part or spatially scattered matches cannot
+        enable the residual by themselves.
+        """
+        if search_grid_size < 1:
+            raise ValueError(
+                f"search_grid_size must be positive, got {search_grid_size}"
+            )
+        batch_size, num_parts, search_length = similarity.shape
+        if search_global_index.shape != (batch_size, search_length):
+            raise ValueError(
+                "search_global_index must have shape [B, L_s], got "
+                f"{tuple(search_global_index.shape)} for similarity "
+                f"{tuple(similarity.shape)}"
+            )
+
+        global_index = search_global_index.to(
+            device=similarity.device, dtype=torch.long
+        )
+        full_length = search_grid_size ** 2
+        if (
+            global_index.numel() == 0
+            or global_index.min() < 0
+            or global_index.max() >= full_length
+        ):
+            raise ValueError(
+                "search_global_index contains values outside the original "
+                f"{search_grid_size}x{search_grid_size} search grid"
+            )
+
+        weighted_similarity = (
+            similarity.clamp_min(0.0) * part_reliability.unsqueeze(-1)
+        )
+        weighted_similarity = weighted_similarity * part_valid.unsqueeze(
+            -1
+        ).to(weighted_similarity.dtype)
+        full_similarity = similarity.new_zeros(
+            batch_size, num_parts, full_length
+        )
+        full_similarity.scatter_(
+            2,
+            global_index[:, None, :].expand(-1, num_parts, -1),
+            weighted_similarity,
+        )
+        full_similarity = full_similarity.view(
+            batch_size, num_parts, search_grid_size, search_grid_size
+        )
+
+        radius = self.candidate_local_radius
+        if radius > 0:
+            local_similarity = F.max_pool2d(
+                full_similarity,
+                kernel_size=2 * radius + 1,
+                stride=1,
+                padding=radius,
+            )
+        else:
+            local_similarity = full_similarity
+        local_similarity = local_similarity.flatten(2).gather(
+            2, global_index[:, None, :].expand(-1, num_parts, -1)
+        )
+
+        consensus_values = local_similarity.topk(
+            self.candidate_consensus_parts, dim=1
+        ).values
+        candidate_evidence = consensus_values.mean(dim=1)
+        consensus_valid = (
+            part_valid.sum(dim=1) >= self.candidate_consensus_parts
+        )
+        candidate_scale = F.softplus(self.candidate_log_match_scale)
+        candidate_logits = (
+            candidate_scale * candidate_evidence + self.candidate_match_bias
+        )
+        candidate_logits = torch.where(
+            consensus_valid[:, None],
+            candidate_logits,
+            candidate_logits.new_full(candidate_logits.shape, -20.0),
+        )
+        candidate_gate = torch.sigmoid(candidate_logits)
+
+        candidate_map = similarity.new_zeros(batch_size, full_length)
+        candidate_map.scatter_(1, global_index, candidate_gate)
+        candidate_map = candidate_map.view(
+            batch_size, 1, search_grid_size, search_grid_size
+        )
+        return (
+            candidate_logits,
+            candidate_gate,
+            candidate_map,
+            consensus_valid,
+        )
 
     def _margin_statistics(
         self,
@@ -305,6 +452,34 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
         token_match = similarity.max(dim=1).values.clamp_min(0.0)
         residual = reconstructed * token_match.unsqueeze(-1)
+        candidate_diagnostics = {}
+        if self.spatial_gate_mode == "candidate_consensus":
+            if search_global_index is None or search_grid_size is None:
+                raise ValueError(
+                    "candidate-consensus gating requires search_global_index "
+                    "and search_grid_size"
+                )
+            (
+                candidate_logits,
+                candidate_gate,
+                candidate_map,
+                consensus_valid,
+            ) = self._candidate_consensus_statistics(
+                similarity,
+                part_reliability,
+                part_valid,
+                search_global_index,
+                int(search_grid_size),
+            )
+            residual = residual * candidate_gate.unsqueeze(-1)
+            candidate_diagnostics = {
+                "candidate_identity_logits": candidate_logits,
+                "candidate_reliability_map": candidate_map,
+                "candidate_consensus_valid": consensus_valid,
+                "candidate_reliability_peak": candidate_gate.max(dim=1).values,
+                "candidate_reliability_mean": candidate_gate.mean(dim=1),
+                "search_global_index": search_global_index,
+            }
         raw_delta = self.alpha * residual
 
         # V4 bounds the *complete* update after alpha, so the learned scalar
@@ -364,4 +539,5 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "vdrm_delta_relative_norm": delta_relative_norm,
         }
         diagnostics.update(margin_diagnostics)
+        diagnostics.update(candidate_diagnostics)
         return output_tokens, diagnostics

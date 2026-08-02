@@ -140,6 +140,76 @@ class VDRMDiagnosticAutomationTest(unittest.TestCase):
             self.assertEqual(len(losses), 4)
             self.assertEqual(len(recommendations), 2)
             self.assertTrue(all(path.is_file() for path in outputs))
+            report = outputs[-1].read_text(encoding="utf-8")
+            self.assertIn("Visual Delta IoU", report)
+            self.assertNotIn("鍏", report)
+
+    def test_report_can_use_full_sequence_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for dataset, anchor_mode in TARGETS:
+                directory = root / "full" / dataset / anchor_mode
+                directory.mkdir(parents=True)
+                sequence = f"{dataset}_full_sequence"
+                sequence_summary = {
+                    "frame_count": 1,
+                    "mean_delta_iou": 0.01,
+                }
+                summary = {
+                    "dataset": dataset,
+                    "anchor_mode": anchor_mode,
+                    "sequence_count": 1,
+                    "frame_count": 1,
+                    "baseline_checkpoint": "baseline.pth.tar",
+                    "vdrm_checkpoint": "v7.pth.tar",
+                    "mean_delta_iou": 0.01,
+                    "mean_center_only_delta_iou": 0.0,
+                    "mean_size_only_delta_iou": 0.0,
+                    "catastrophic_vdrm_frames": 0,
+                    "sequences": {sequence: sequence_summary},
+                    "largest_vdrm_losses": [],
+                    "reliability": {
+                        "visual_reliability": {
+                            "correct_vs_failed_auc": 0.8,
+                            "spearman_with_vdrm_iou": 0.2,
+                        },
+                        "candidate_target_reliability": {
+                            "correct_vs_failed_auc": 0.9,
+                            "vdrm_better_vs_worse_auc": 0.7,
+                            "spearman_with_vdrm_iou": 0.3,
+                        },
+                    },
+                    "residual": {
+                        "residual_relative_norm_mean": {
+                            "correct_mean": 0.1,
+                            "failed_mean": 0.05,
+                        },
+                        "residual_top10_energy_fraction": {
+                            "correct_mean": 0.2,
+                            "failed_mean": 0.1,
+                        },
+                    },
+                }
+                (directory / "dataset_summary.json").write_text(
+                    json.dumps(summary), encoding="utf-8"
+                )
+                (directory / f"{sequence}_summary.json").write_text(
+                    json.dumps(sequence_summary), encoding="utf-8"
+                )
+                with (directory / f"{sequence}.csv").open(
+                    "w", newline="", encoding="utf-8"
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=("frame",))
+                    writer.writeheader()
+                    writer.writerow({"frame": 1})
+
+            rows, losses, _ = build_report(root, prefer_full=True)
+
+            self.assertTrue(all(row["source_scope"] == "full" for row in rows))
+            self.assertTrue(all("full" in item["csv"] for item in losses))
+            self.assertEqual(
+                rows[0]["candidate_correct_vs_failed_auc"], 0.9
+            )
 
 
 if __name__ == "__main__":

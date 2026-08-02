@@ -111,6 +111,112 @@ def compute_vdrm_part_rank_loss(
     return (element_loss * loss_weight).sum() / loss_weight.sum().clamp_min(1.0)
 
 
+def compute_vdrm_candidate_focal_loss(
+    candidate_logits,
+    search_global_index,
+    gaussian_map,
+    sample_valid=None,
+    alpha=2.0,
+    beta=4.0,
+):
+    """Supervise candidate consensus on retained CE search locations.
+
+    This is the CenterNet focal objective applied before residual injection.
+    It teaches the spatial gate to select the target candidate, rather than
+    merely predicting whether template parts occur somewhere in the search.
+    """
+    if candidate_logits.ndim != 2:
+        raise ValueError(
+            "candidate_logits must have shape [B, L], got "
+            f"{tuple(candidate_logits.shape)}"
+        )
+    batch_size, search_length = candidate_logits.shape
+    if search_global_index.shape != (batch_size, search_length):
+        raise ValueError(
+            "search_global_index must have shape [B, L], got "
+            f"{tuple(search_global_index.shape)}"
+        )
+    if gaussian_map.ndim != 3 or gaussian_map.shape[0] != batch_size:
+        raise ValueError(
+            "gaussian_map must have shape [B, H, W], got "
+            f"{tuple(gaussian_map.shape)}"
+        )
+
+    global_index = search_global_index.to(
+        device=candidate_logits.device, dtype=torch.long
+    )
+    flat_gaussian = gaussian_map.to(
+        device=candidate_logits.device, dtype=candidate_logits.dtype
+    ).flatten(1)
+    if (
+        global_index.numel() == 0
+        or global_index.min() < 0
+        or global_index.max() >= flat_gaussian.shape[1]
+    ):
+        raise ValueError("search_global_index is outside gaussian_map")
+    retained_target = flat_gaussian.gather(1, global_index)
+
+    # CE can remove the exact center token. Promote the nearest retained token
+    # to the positive center so every valid sample retains one stable target.
+    positive_mask = retained_target.eq(1.0)
+    missing_positive = ~positive_mask.any(dim=1)
+    if missing_positive.any():
+        full_peak_index = flat_gaussian.argmax(dim=1)
+        grid_width = gaussian_map.shape[2]
+        token_x = global_index.remainder(grid_width)
+        token_y = global_index.div(grid_width, rounding_mode="floor")
+        peak_x = full_peak_index.remainder(grid_width).unsqueeze(1)
+        peak_y = full_peak_index.div(
+            grid_width, rounding_mode="floor"
+        ).unsqueeze(1)
+        squared_distance = (token_x - peak_x).square() + (
+            token_y - peak_y
+        ).square()
+        fallback_index = squared_distance.argmin(dim=1, keepdim=True)
+        fallback_mask = torch.zeros_like(retained_target, dtype=torch.bool)
+        fallback_mask.scatter_(1, fallback_index, True)
+        retained_target = torch.where(
+            missing_positive[:, None] & fallback_mask,
+            torch.ones_like(retained_target),
+            retained_target,
+        )
+        positive_mask = retained_target.eq(1.0)
+
+    probability = torch.sigmoid(candidate_logits).clamp(
+        1e-6, 1.0 - 1e-6
+    )
+    negative_mask = retained_target.lt(1.0)
+    negative_weight = (1.0 - retained_target).pow(float(beta))
+    positive_loss = (
+        probability.log()
+        * (1.0 - probability).pow(float(alpha))
+        * positive_mask.to(probability.dtype)
+    ).sum(dim=1)
+    negative_loss = (
+        (1.0 - probability).log()
+        * probability.pow(float(alpha))
+        * negative_weight
+        * negative_mask.to(probability.dtype)
+    ).sum(dim=1)
+    normalizer = positive_mask.sum(dim=1).clamp_min(1).to(probability.dtype)
+    per_sample_loss = -(positive_loss + negative_loss) / normalizer
+
+    if sample_valid is None:
+        valid_weight = torch.ones_like(per_sample_loss)
+    else:
+        if sample_valid.shape != (batch_size,):
+            raise ValueError(
+                "sample_valid must have shape [B], got "
+                f"{tuple(sample_valid.shape)}"
+            )
+        valid_weight = sample_valid.to(
+            device=per_sample_loss.device, dtype=per_sample_loss.dtype
+        )
+    return (
+        per_sample_loss * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1.0)
+
+
 def compute_vdrm_response_rank_loss(
     score_logits,
     gaussian_map,
@@ -394,6 +500,7 @@ class OSTrackActor(BaseActor):
             location_loss = torch.tensor(0.0, device=l1_loss.device)
         visibility_loss = pred_boxes.new_zeros(())
         rank_loss = pred_boxes.new_zeros(())
+        candidate_loss = pred_boxes.new_zeros(())
         rank_diagnostics = None
         aux_weight_scale = 0.0
 
@@ -483,6 +590,28 @@ class OSTrackActor(BaseActor):
                     )
                 )
 
+            spatial_gate_mode = getattr(
+                vdrm_cfg, 'SPATIAL_GATE_MODE', 'token_match'
+            )
+            if spatial_gate_mode == 'candidate_consensus':
+                required_candidate_outputs = {
+                    'candidate_identity_logits', 'search_global_index'
+                }
+                missing_candidate_outputs = (
+                    required_candidate_outputs.difference(pred_dict)
+                )
+                if missing_candidate_outputs:
+                    raise RuntimeError(
+                        "VDRM candidate loss is missing model outputs: "
+                        f"{sorted(missing_candidate_outputs)}"
+                    )
+                candidate_loss = compute_vdrm_candidate_focal_loss(
+                    pred_dict['candidate_identity_logits'],
+                    pred_dict['search_global_index'],
+                    gt_gaussian_maps.squeeze(1),
+                    sample_valid=pred_dict.get('candidate_consensus_valid'),
+                )
+
             warmup_epochs = self.cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS
             epoch = float(gt_dict.get('epoch', 1))
             if warmup_epochs <= 1:
@@ -498,6 +627,7 @@ class OSTrackActor(BaseActor):
             loss = loss + aux_weight_scale * (
                 self.cfg.TRAIN.VDRM_VISIBILITY_WEIGHT * visibility_loss
                 + self.cfg.TRAIN.VDRM_RANK_WEIGHT * rank_loss
+                + self.cfg.TRAIN.VDRM_CANDIDATE_WEIGHT * candidate_loss
             )
         if return_status:
             # status for log
@@ -511,12 +641,27 @@ class OSTrackActor(BaseActor):
                 status.update({
                     "Loss/vdrm_visibility": visibility_loss.item(),
                     "Loss/vdrm_rank": rank_loss.item(),
+                    "Loss/vdrm_candidate": candidate_loss.item(),
                     "VDRM/aux_weight_scale": aux_weight_scale,
                     "VDRM/alpha": pred_dict['vdrm_alpha'].detach().item()
                     if 'vdrm_alpha' in pred_dict else 0.0,
                     "VDRM/reliability": pred_dict['visual_reliability'].detach().mean().item()
                     if 'visual_reliability' in pred_dict else 0.0,
                 })
+                if 'candidate_target_reliability' in pred_dict:
+                    status["VDRM/candidate_target_reliability"] = (
+                        pred_dict['candidate_target_reliability']
+                        .detach()
+                        .mean()
+                        .item()
+                    )
+                if 'candidate_reliability_mean' in pred_dict:
+                    status["VDRM/candidate_reliability_mean"] = (
+                        pred_dict['candidate_reliability_mean']
+                        .detach()
+                        .mean()
+                        .item()
+                    )
                 if "vdrm_distractor_applied" in gt_dict:
                     status["VDRM/distractor_applied_rate"] = (
                         gt_dict["vdrm_distractor_applied"]

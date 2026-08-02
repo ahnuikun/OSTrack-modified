@@ -41,6 +41,13 @@ cfg.MODEL.VDRM.INITIAL_MATCH_SCALE = 5.0
 cfg.MODEL.VDRM.INITIAL_MATCH_BIAS = -2.5
 # 0 disables the V4 relative-norm residual bound for V1/V2/V3 compatibility.
 cfg.MODEL.VDRM.RESIDUAL_MAX_RATIO = 0.0
+# V7-only candidate-consistent spatial residual gate. ``token_match`` keeps
+# the exact V1-V6 forward path and state-dict schema.
+cfg.MODEL.VDRM.SPATIAL_GATE_MODE = "token_match"
+cfg.MODEL.VDRM.CANDIDATE_LOCAL_RADIUS = 1
+cfg.MODEL.VDRM.CANDIDATE_CONSENSUS_PARTS = 2
+cfg.MODEL.VDRM.CANDIDATE_INITIAL_MATCH_SCALE = 5.0
+cfg.MODEL.VDRM.CANDIDATE_INITIAL_MATCH_BIAS = -2.5
 
 # MODEL.HEAD
 cfg.MODEL.HEAD = edict()
@@ -70,6 +77,7 @@ cfg.TRAIN.CE_WARM_EPOCH = 80  # candidate elimination warm up epoch
 cfg.TRAIN.DROP_PATH_RATE = 0.1  # drop path rate for ViT backbone
 cfg.TRAIN.VDRM_VISIBILITY_WEIGHT = 0.5
 cfg.TRAIN.VDRM_RANK_WEIGHT = 0.5
+cfg.TRAIN.VDRM_CANDIDATE_WEIGHT = 0.0
 cfg.TRAIN.VDRM_RANK_MARGIN = 0.1
 cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS = 20
 # V5-only switch. When enabled, HNCP samples take the rank negative from the

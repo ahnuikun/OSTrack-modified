@@ -408,6 +408,8 @@ def main(argv: Optional[Sequence[str]] = None):
         "--vdrm-checkpoint",
         vdrm_checkpoint,
     ]
+    if args.full_paired:
+        report_command.append("--prefer-full")
     run_logged(report_command, run_root / "report.log")
     print("\nVDRM diagnostic plan completed")
     print("run_root:", run_root)

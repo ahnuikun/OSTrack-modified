@@ -36,9 +36,14 @@ class VisionTransformerCE(VisionTransformer):
                  ce_loc=None, ce_keep_ratio=None,
                  vdrm_enabled=False, vdrm_insert_layer=6, vdrm_num_parts=4,
                  vdrm_topk=4, vdrm_reliability_mode="topk",
-                 vdrm_nms_radius=1, vdrm_initial_match_scale=5.0,
-                 vdrm_initial_match_bias=-2.5,
-                 vdrm_residual_max_ratio=0.0):
+                  vdrm_nms_radius=1, vdrm_initial_match_scale=5.0,
+                  vdrm_initial_match_bias=-2.5,
+                  vdrm_residual_max_ratio=0.0,
+                  vdrm_spatial_gate_mode="token_match",
+                  vdrm_candidate_local_radius=1,
+                  vdrm_candidate_consensus_parts=2,
+                  vdrm_candidate_initial_match_scale=5.0,
+                  vdrm_candidate_initial_match_bias=-2.5):
         """
         Args:
             img_size (int, tuple): input image size
@@ -119,6 +124,13 @@ class VisionTransformerCE(VisionTransformer):
                 initial_match_scale=vdrm_initial_match_scale,
                 initial_match_bias=vdrm_initial_match_bias,
                 residual_max_ratio=vdrm_residual_max_ratio,
+                spatial_gate_mode=vdrm_spatial_gate_mode,
+                candidate_local_radius=vdrm_candidate_local_radius,
+                candidate_consensus_parts=vdrm_candidate_consensus_parts,
+                candidate_initial_match_scale=(
+                    vdrm_candidate_initial_match_scale
+                ),
+                candidate_initial_match_bias=vdrm_candidate_initial_match_bias,
             )
         else:
             self.vdrm = None

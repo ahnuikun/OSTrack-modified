@@ -5,6 +5,7 @@ import torch
 
 from lib.models.layers.vdrm import VisibilityDrivenRepresentationModule
 from lib.train.actors.ostrack import (
+    compute_vdrm_candidate_focal_loss,
     compute_vdrm_part_rank_loss,
     compute_vdrm_response_rank_loss,
 )
@@ -170,6 +171,109 @@ class VDRMTest(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(default_output, explicit_output))
+
+    def test_default_mode_preserves_pre_v7_state_dict_schema(self):
+        module = VisibilityDrivenRepresentationModule(num_parts=4, topk=4)
+
+        self.assertEqual(
+            set(module.state_dict()),
+            {"log_match_scale", "match_bias", "alpha"},
+        )
+
+    def test_candidate_consensus_prefers_colocated_multi_part_evidence(self):
+        module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            spatial_gate_mode="candidate_consensus",
+            candidate_local_radius=1,
+            candidate_consensus_parts=2,
+        )
+        similarity = torch.zeros(1, 4, 25)
+        # Two different parts agree around candidate (2, 2).
+        similarity[0, 0, 6] = 0.9
+        similarity[0, 1, 7] = 0.8
+        # A stronger but isolated part appears at the opposite corner.
+        similarity[0, 2, 24] = 0.95
+        part_reliability = torch.ones(1, 4)
+        part_valid = torch.ones(1, 4, dtype=torch.bool)
+        global_index = torch.arange(25).unsqueeze(0)
+
+        logits, gate, candidate_map, valid = (
+            module._candidate_consensus_statistics(
+                similarity,
+                part_reliability,
+                part_valid,
+                global_index,
+                search_grid_size=5,
+            )
+        )
+
+        self.assertEqual(logits.shape, (1, 25))
+        self.assertEqual(gate.shape, (1, 25))
+        self.assertEqual(candidate_map.shape, (1, 1, 5, 5))
+        self.assertTrue(valid.item())
+        self.assertGreater(gate[0, 12].item(), gate[0, 24].item() + 0.2)
+
+    def test_candidate_mode_preserves_zero_initialized_forward(self):
+        torch.manual_seed(17)
+        module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            spatial_gate_mode="candidate_consensus",
+        )
+        tokens = torch.randn(2, 64 + 37, 32, requires_grad=True)
+        global_index = torch.arange(37).unsqueeze(0).repeat(2, 1)
+
+        output, diagnostics = module(
+            tokens,
+            template_length=64,
+            template_bbox=torch.tensor(
+                [[0.25, 0.25, 0.50, 0.50]] * 2
+            ),
+            search_global_index=global_index,
+            search_grid_size=16,
+        )
+
+        self.assertTrue(torch.equal(output, tokens))
+        self.assertEqual(
+            diagnostics["candidate_identity_logits"].shape, (2, 37)
+        )
+        self.assertEqual(
+            diagnostics["candidate_reliability_map"].shape,
+            (2, 1, 16, 16),
+        )
+        gaussian_map = torch.zeros(2, 16, 16)
+        gaussian_map[:, 1, 1] = 1.0
+        candidate_loss = compute_vdrm_candidate_focal_loss(
+            diagnostics["candidate_identity_logits"],
+            diagnostics["search_global_index"],
+            gaussian_map,
+            sample_valid=diagnostics["candidate_consensus_valid"],
+        )
+        candidate_loss.backward()
+        self.assertIsNotNone(module.candidate_log_match_scale.grad)
+        self.assertIsNotNone(module.candidate_match_bias.grad)
+        self.assertTrue(torch.isfinite(tokens.grad).all())
+
+    def test_candidate_focal_loss_rewards_the_target_candidate(self):
+        global_index = torch.arange(16).unsqueeze(0)
+        gaussian_map = torch.zeros(1, 4, 4)
+        gaussian_map[0, 1, 1] = 1.0
+        good_logits = torch.full((1, 16), -3.0, requires_grad=True)
+        bad_logits = torch.full((1, 16), -3.0)
+        with torch.no_grad():
+            good_logits[0, 5] = 3.0
+            bad_logits[0, 15] = 3.0
+
+        good_loss = compute_vdrm_candidate_focal_loss(
+            good_logits, global_index, gaussian_map
+        )
+        bad_loss = compute_vdrm_candidate_focal_loss(
+            bad_logits, global_index, gaussian_map
+        )
+
+        self.assertLess(good_loss.item(), bad_loss.item())
+        good_loss.backward()
+        self.assertIsNotNone(good_logits.grad)
+        self.assertTrue(torch.isfinite(good_logits.grad).all())
 
     def test_margin_reliability_suppresses_the_first_peak_neighborhood(self):
         module = VisibilityDrivenRepresentationModule(

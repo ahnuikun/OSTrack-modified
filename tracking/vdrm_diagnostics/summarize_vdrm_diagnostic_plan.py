@@ -57,8 +57,12 @@ def _load_target(
     anchor_mode: str,
     baseline_checkpoint: Optional[Path],
     vdrm_checkpoint: Optional[Path],
+    prefer_full: bool = False,
 ):
-    directory = run_root / dataset_name / anchor_mode
+    relative = Path(dataset_name) / anchor_mode
+    if prefer_full:
+        relative = Path("full") / relative
+    directory = run_root / relative
     summary_path = directory / "dataset_summary.json"
     if not summary_path.is_file():
         raise FileNotFoundError(summary_path)
@@ -90,26 +94,50 @@ def _recommendations(rows, material_delta: float):
         gt = by_key[(dataset_name, "ground_truth")]
         replay = by_key[(dataset_name, "baseline_replay")]
         if gt["mean_delta_iou"] <= -material_delta:
-            cause = "共享 GT 裁剪下已回归：VDRM 表征或残差直接损害视觉输出。"
-            action = "优先修改部件匹配、残差注入和候选身份判别。"
+            cause = (
+                "VDRM regresses under the shared ground-truth crop, which "
+                "points to representation or residual-injection damage."
+            )
+            action = (
+                "Prioritize part matching, candidate identity, and spatial "
+                "residual injection."
+            )
         elif replay["mean_delta_iou"] <= -material_delta:
-            cause = "GT 裁剪基本正常，但基准回放下降：对偏心/尺度错误裁剪不鲁棒。"
-            action = "加强裁剪扰动目标保持与真实硬负监督。"
+            cause = (
+                "Ground-truth crops are stable but baseline-replay crops "
+                "regress, indicating sensitivity to center/scale errors."
+            )
+            action = (
+                "Prioritize candidate identity under realistic crop "
+                "perturbations."
+            )
         else:
-            cause = "配对 Backend 未发现显著整体回归。"
-            action = "重点检查标准 V3 闭环中的搜索反馈放大。"
+            cause = (
+                "Shared-crop averages are stable; inspect standard VDRM "
+                "closed-loop feedback amplification and tail failures."
+            )
+            action = (
+                "Require candidate-consistent residual gating before "
+                "changing HNCP geometry or probability."
+            )
 
         component_actions = []
         if min(
             gt["mean_center_only_delta_iou"],
             replay["mean_center_only_delta_iou"],
         ) <= -material_delta:
-            component_actions.append("中心项为负，优先候选一致的身份判别")
+            component_actions.append(
+                "Center term regresses: prioritize candidate-level target "
+                "identity."
+            )
         if min(
             gt["mean_size_only_delta_iou"],
             replay["mean_size_only_delta_iou"],
         ) <= -material_delta:
-            component_actions.append("尺度项为负，隔离残差对 size/offset 分支的干扰")
+            component_actions.append(
+                "Size term regresses: isolate residual effects on size and "
+                "offset only after the center hypothesis is tested."
+            )
         reliability_auc = replay["visual_correct_vs_failed_auc"]
         reliability_rho = replay["visual_spearman_with_vdrm_iou"]
         if (
@@ -118,7 +146,10 @@ def _recommendations(rows, material_delta: float):
             or reliability_rho is None
             or reliability_rho <= 0.0
         ):
-            component_actions.append("可靠度区分失败不足，改为候选级目标可靠度")
+            component_actions.append(
+                "Absolute visual reliability does not separate failures "
+                "well; add candidate-level target reliability."
+            )
 
         failed_norm = replay["residual_relative_norm_failed"]
         correct_norm = replay["residual_relative_norm_correct"]
@@ -133,7 +164,10 @@ def _recommendations(rows, material_delta: float):
             and correct_top10 is not None
             and failed_top10 > correct_top10
         ):
-            component_actions.append("失败帧残差更强或更集中，限制错误位置的残差能量")
+            component_actions.append(
+                "Residual energy increases on failures; inspect spatial "
+                "concentration before considering a bound."
+            )
 
         recommendations.append(
             {
@@ -151,6 +185,7 @@ def build_report(
     baseline_checkpoint: Optional[Path] = None,
     vdrm_checkpoint: Optional[Path] = None,
     material_delta: float = 0.01,
+    prefer_full: bool = False,
 ):
     rows = []
     losses = []
@@ -161,6 +196,7 @@ def build_report(
             anchor_mode,
             baseline_checkpoint,
             vdrm_checkpoint,
+            prefer_full=prefer_full,
         )
         worst_sequence, worst_summary = min(
             summary["sequences"].items(),
@@ -171,7 +207,11 @@ def build_report(
             ),
         )
         visual = summary["reliability"]["visual_reliability"]
+        candidate = summary.get("reliability", {}).get(
+            "candidate_target_reliability", {}
+        )
         row = {
+            "source_scope": "full" if prefer_full else "selected",
             "dataset": dataset_name,
             "anchor_mode": anchor_mode,
             "sequence_count": summary["sequence_count"],
@@ -192,6 +232,15 @@ def build_report(
             "visual_spearman_with_vdrm_iou": visual[
                 "spearman_with_vdrm_iou"
             ],
+            "candidate_correct_vs_failed_auc": candidate.get(
+                "correct_vs_failed_auc"
+            ),
+            "candidate_better_vs_worse_auc": candidate.get(
+                "vdrm_better_vs_worse_auc"
+            ),
+            "candidate_spearman_with_vdrm_iou": candidate.get(
+                "spearman_with_vdrm_iou"
+            ),
             "residual_relative_norm_correct": _metric(
                 summary,
                 "residual",
@@ -227,6 +276,7 @@ def build_report(
         rows.append(row)
         losses.append(
             {
+                "source_scope": row["source_scope"],
                 "dataset": dataset_name,
                 "anchor_mode": anchor_mode,
                 "worst_sequence": worst_sequence,
@@ -261,27 +311,38 @@ def write_report(run_root: Path, rows, losses, recommendations):
     lines = [
         "# VDRM Backend Pair Diagnostic Report",
         "",
+        f"Source scope: `{rows[0]['source_scope']}`",
+        "",
         "## Five-axis evidence",
         "",
         (
-            "| Dataset | Anchor | Visual ΔIoU | Center ΔIoU | Size ΔIoU | "
-            "Reliability AUC | Reliability ρ | Residual norm "
-            "correct/failed | Top10 energy correct/failed | Catastrophic |"
+            "| Dataset | Anchor | Visual Delta IoU | Center Delta IoU | "
+            "Size Delta IoU | Visual AUC | Candidate AUC | Candidate pair "
+            "AUC | Residual norm correct/failed | Top10 energy "
+            "correct/failed | Catastrophic |"
         ),
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        (
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        ),
     ]
     for row in rows:
         lines.append(
             "| {dataset} | {anchor_mode} | {delta} | {center} | {size} | "
-            "{auc} | {rho} | {norm_correct}/{norm_failed} | "
-            "{top_correct}/{top_failed} | {catastrophic} |".format(
+            "{visual_auc} | {candidate_auc} | {candidate_pair_auc} | "
+            "{norm_correct}/{norm_failed} | {top_correct}/{top_failed} | "
+            "{catastrophic} |".format(
                 dataset=row["dataset"],
                 anchor_mode=row["anchor_mode"],
                 delta=_format(row["mean_delta_iou"]),
                 center=_format(row["mean_center_only_delta_iou"]),
                 size=_format(row["mean_size_only_delta_iou"]),
-                auc=_format(row["visual_correct_vs_failed_auc"]),
-                rho=_format(row["visual_spearman_with_vdrm_iou"]),
+                visual_auc=_format(row["visual_correct_vs_failed_auc"]),
+                candidate_auc=_format(
+                    row["candidate_correct_vs_failed_auc"]
+                ),
+                candidate_pair_auc=_format(
+                    row["candidate_better_vs_worse_auc"]
+                ),
                 norm_correct=_format(
                     row["residual_relative_norm_correct"]
                 ),
@@ -297,13 +358,15 @@ def write_report(run_root: Path, rows, losses, recommendations):
         lines.append(f"### {recommendation['dataset']}")
         lines.append("")
         lines.append(f"- Root-cause signal: {recommendation['cause']}")
-        lines.append(f"- Primary direction: {recommendation['primary_action']}")
+        lines.append(
+            f"- Primary direction: {recommendation['primary_action']}"
+        )
         for action in recommendation["component_actions"]:
             lines.append(f"- Additional evidence: {action}")
         lines.append("")
     lines.append(
-        "模块一仍需独立通过 Gate；联合 V3-Primary Reliability-Conditioned "
-        "M2 不替代模块一优化。"
+        "Module one must still pass its independent Gate; a joint "
+        "V3-Primary Reliability-Conditioned M2 result does not replace it."
     )
 
     report_path = run_root / "diagnostic_report.md"
@@ -319,6 +382,11 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--baseline-checkpoint", type=Path)
     parser.add_argument("--vdrm-checkpoint", type=Path)
     parser.add_argument("--material-delta", type=float, default=0.01)
+    parser.add_argument(
+        "--prefer-full",
+        action="store_true",
+        help="Read run_root/full/<dataset>/<anchor> instead of selected runs.",
+    )
     return parser.parse_args(argv)
 
 
@@ -329,6 +397,7 @@ def main(argv: Optional[Sequence[str]] = None):
         args.baseline_checkpoint,
         args.vdrm_checkpoint,
         args.material_delta,
+        prefer_full=args.prefer_full,
     )
     outputs = write_report(
         args.run_root, rows, losses, recommendations

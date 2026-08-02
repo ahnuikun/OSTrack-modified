@@ -326,8 +326,22 @@ class BackendRunner:
             "score": float(score_map.max().detach().item()),
             "response_map": score_map.detach(),
         }
+        candidate_map = output.get("candidate_reliability_map")
+        if candidate_map is not None:
+            selected_index = response.flatten(1).argmax(
+                dim=1, keepdim=True
+            )
+            result["candidate_target_reliability"] = float(
+                candidate_map.flatten(1)
+                .gather(1, selected_index)
+                .detach()
+                .mean()
+                .item()
+            )
         for name in (
             "visual_reliability",
+            "candidate_reliability_peak",
+            "candidate_reliability_mean",
             "vdrm_alpha",
             "vdrm_residual_clip_rate",
             "vdrm_raw_delta_relative_norm",
@@ -481,6 +495,9 @@ def build_pair_row(
     visual_reliability = float(
         vdrm_output.get("visual_reliability", math.nan)
     )
+    candidate_target_reliability = float(
+        vdrm_output.get("candidate_target_reliability", math.nan)
+    )
     response_uniqueness = max(
         0.0, min(1.0, 1.0 - vdrm_response["peak_ratio"])
     )
@@ -539,6 +556,13 @@ def build_pair_row(
         "vdrm_score": vdrm_output["score"],
         "response_peak_shift_normalized": peak_shift,
         "visual_reliability": visual_reliability,
+        "candidate_target_reliability": candidate_target_reliability,
+        "candidate_reliability_peak": float(
+            vdrm_output.get("candidate_reliability_peak", math.nan)
+        ),
+        "candidate_reliability_mean": float(
+            vdrm_output.get("candidate_reliability_mean", math.nan)
+        ),
         "baseline_response_reliability": baseline_response[
             "response_reliability"
         ],
@@ -722,6 +746,9 @@ def _extreme_frames(rows, reverse):
             "vdrm_iou": row["vdrm_iou"],
             "delta_iou": row["delta_iou"],
             "visual_reliability": row["visual_reliability"],
+            "candidate_target_reliability": row.get(
+                "candidate_target_reliability"
+            ),
             "combined_reliability": row["combined_reliability"],
         }
         for row in selected

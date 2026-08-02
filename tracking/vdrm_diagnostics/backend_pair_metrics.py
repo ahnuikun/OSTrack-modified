@@ -389,6 +389,9 @@ def summarize_pair_rows(
     delta_iou = [float(row["delta_iou"]) for row in valid_rows]
     metric_names = (
         "visual_reliability",
+        "candidate_target_reliability",
+        "candidate_reliability_peak",
+        "candidate_reliability_mean",
         "vdrm_response_reliability",
         "combined_reliability",
     )

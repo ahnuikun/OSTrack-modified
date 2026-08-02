@@ -58,6 +58,21 @@ class OSTrack(nn.Module):
             feat_last = x[-1]
         out = self.forward_head(feat_last, None)
 
+        candidate_map = aux_dict.get('candidate_reliability_map')
+        score_map = out.get('score_map')
+        if candidate_map is not None and score_map is not None:
+            if candidate_map.shape != score_map.shape:
+                raise RuntimeError(
+                    "candidate reliability map must match the center score "
+                    f"map, got {candidate_map.shape} and {score_map.shape}"
+                )
+            selected_index = score_map.flatten(1).argmax(
+                dim=1, keepdim=True
+            )
+            aux_dict['candidate_target_reliability'] = (
+                candidate_map.flatten(1).gather(1, selected_index).squeeze(1)
+            )
+
         out.update(aux_dict)
         out['backbone_feat'] = x
         return out
@@ -140,6 +155,11 @@ def build_ostrack(cfg, training=True):
                                            vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                            vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                            vdrm_residual_max_ratio=vdrm_cfg.RESIDUAL_MAX_RATIO if vdrm_enabled else 0.0,
+                                            vdrm_spatial_gate_mode=vdrm_cfg.SPATIAL_GATE_MODE if vdrm_enabled else "token_match",
+                                            vdrm_candidate_local_radius=vdrm_cfg.CANDIDATE_LOCAL_RADIUS if vdrm_enabled else 1,
+                                            vdrm_candidate_consensus_parts=vdrm_cfg.CANDIDATE_CONSENSUS_PARTS if vdrm_enabled else 2,
+                                            vdrm_candidate_initial_match_scale=vdrm_cfg.CANDIDATE_INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
+                                            vdrm_candidate_initial_match_bias=vdrm_cfg.CANDIDATE_INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                            )
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
@@ -159,6 +179,11 @@ def build_ostrack(cfg, training=True):
                                             vdrm_initial_match_scale=vdrm_cfg.INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
                                             vdrm_initial_match_bias=vdrm_cfg.INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                             vdrm_residual_max_ratio=vdrm_cfg.RESIDUAL_MAX_RATIO if vdrm_enabled else 0.0,
+                                            vdrm_spatial_gate_mode=vdrm_cfg.SPATIAL_GATE_MODE if vdrm_enabled else "token_match",
+                                            vdrm_candidate_local_radius=vdrm_cfg.CANDIDATE_LOCAL_RADIUS if vdrm_enabled else 1,
+                                            vdrm_candidate_consensus_parts=vdrm_cfg.CANDIDATE_CONSENSUS_PARTS if vdrm_enabled else 2,
+                                            vdrm_candidate_initial_match_scale=vdrm_cfg.CANDIDATE_INITIAL_MATCH_SCALE if vdrm_enabled else 5.0,
+                                            vdrm_candidate_initial_match_bias=vdrm_cfg.CANDIDATE_INITIAL_MATCH_BIAS if vdrm_enabled else -2.5,
                                             )
 
         hidden_dim = backbone.embed_dim

@@ -129,6 +129,27 @@ class OSTrack(BaseTracker):
         visual_reliability = out_dict.get('visual_reliability')
         if visual_reliability is not None:
             visual_reliability = visual_reliability.detach().mean().item()
+        candidate_target_reliability = out_dict.get(
+            'candidate_target_reliability'
+        )
+        if candidate_target_reliability is not None:
+            candidate_target_reliability = (
+                candidate_target_reliability.detach().mean().item()
+            )
+        candidate_reliability_peak = out_dict.get(
+            'candidate_reliability_peak'
+        )
+        if candidate_reliability_peak is not None:
+            candidate_reliability_peak = (
+                candidate_reliability_peak.detach().mean().item()
+            )
+        candidate_reliability_mean = out_dict.get(
+            'candidate_reliability_mean'
+        )
+        if candidate_reliability_mean is not None:
+            candidate_reliability_mean = (
+                candidate_reliability_mean.detach().mean().item()
+            )
         part_reliability = out_dict.get('part_reliability')
         if part_reliability is not None:
             part_reliability = (
@@ -173,6 +194,20 @@ class OSTrack(BaseTracker):
                 delta_relative_norm.detach().mean().item()
             )
         response = self.output_window * pred_score_map
+        candidate_reliability_map = out_dict.get(
+            'candidate_reliability_map'
+        )
+        if candidate_reliability_map is not None:
+            selected_index = response.flatten(1).argmax(
+                dim=1, keepdim=True
+            )
+            candidate_target_reliability = (
+                candidate_reliability_map.flatten(1)
+                .gather(1, selected_index)
+                .detach()
+                .mean()
+                .item()
+            )
         pred_boxes = self.network.box_head.cal_bbox(response, out_dict['size_map'], out_dict['offset_map'])
         pred_boxes = pred_boxes.view(-1, 4)
         # Baseline: Take the mean of all pred boxes as the final result
@@ -217,6 +252,9 @@ class OSTrack(BaseTracker):
                     "score": max_score,
                     "response_map": pred_score_map.detach(),
                     "visual_reliability": visual_reliability,
+                    "candidate_target_reliability": candidate_target_reliability,
+                    "candidate_reliability_peak": candidate_reliability_peak,
+                    "candidate_reliability_mean": candidate_reliability_mean,
                     "part_reliability": part_reliability,
                     "part_valid": part_valid,
                     "part_peak_similarity": part_peak_similarity,
@@ -232,6 +270,9 @@ class OSTrack(BaseTracker):
                 "score": max_score,
                 "response_map": pred_score_map.detach(),
                 "visual_reliability": visual_reliability,
+                "candidate_target_reliability": candidate_target_reliability,
+                "candidate_reliability_peak": candidate_reliability_peak,
+                "candidate_reliability_mean": candidate_reliability_mean,
                 "part_reliability": part_reliability,
                 "part_valid": part_valid,
                 "part_peak_similarity": part_peak_similarity,
