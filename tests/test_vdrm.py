@@ -5,7 +5,9 @@ import torch
 
 from lib.models.layers.vdrm import VisibilityDrivenRepresentationModule
 from lib.train.actors.ostrack import (
+    build_vdrm_part_route_targets,
     compute_vdrm_candidate_focal_loss,
+    compute_vdrm_part_route_loss,
     compute_vdrm_part_rank_loss,
     compute_vdrm_response_rank_loss,
 )
@@ -179,6 +181,126 @@ class VDRMTest(unittest.TestCase):
             set(module.state_dict()),
             {"log_match_scale", "match_bias", "alpha"},
         )
+
+    def test_part_aligned_mode_preserves_zero_initialized_forward(self):
+        torch.manual_seed(23)
+        module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            spatial_gate_mode="part_aligned",
+            alpha_max=1.5,
+        )
+        tokens = torch.randn(2, 64 + 37, 32, requires_grad=True)
+        global_index = torch.arange(37).unsqueeze(0).repeat(2, 1)
+
+        output, diagnostics = module(
+            tokens,
+            template_length=64,
+            template_bbox=torch.tensor(
+                [[0.25, 0.25, 0.50, 0.50]] * 2
+            ),
+            search_global_index=global_index,
+            search_grid_size=16,
+        )
+
+        self.assertTrue(torch.equal(output, tokens))
+        self.assertEqual(diagnostics["part_route_logits"].shape, (2, 4, 37))
+        self.assertEqual(diagnostics["part_route_gate"].shape, (2, 4, 37))
+        self.assertEqual(diagnostics["vdrm_alpha"].item(), 0.0)
+        self.assertEqual(
+            set(module.state_dict()),
+            {
+                "log_match_scale",
+                "match_bias",
+                "part_route_log_match_scale",
+                "part_route_match_bias",
+                "alpha",
+            },
+        )
+
+    def test_part_aligned_layerscale_is_bounded(self):
+        torch.manual_seed(29)
+        module = VisibilityDrivenRepresentationModule(
+            num_parts=4,
+            spatial_gate_mode="part_aligned",
+            alpha_max=1.5,
+        )
+        module.alpha.data.fill_(-100.0)
+        tokens = torch.randn(1, 64 + 37, 16)
+
+        output, diagnostics = module(
+            tokens,
+            template_length=64,
+            search_global_index=torch.arange(37).unsqueeze(0),
+            search_grid_size=16,
+        )
+
+        self.assertFalse(torch.equal(output, tokens))
+        self.assertGreaterEqual(diagnostics["vdrm_alpha"].item(), -1.5)
+        self.assertLessEqual(diagnostics["vdrm_alpha"].item(), 1.5)
+        self.assertEqual(diagnostics["vdrm_alpha_raw"].item(), -100.0)
+
+    def test_part_route_targets_follow_the_four_target_parts(self):
+        targets = build_vdrm_part_route_targets(
+            torch.tensor([[0.25, 0.25, 0.50, 0.50]]),
+            height=8,
+            width=8,
+            num_parts=4,
+            dilation=0.0,
+        )
+
+        self.assertEqual(targets.shape, (1, 4, 8, 8))
+        expected_core_tokens = [(2, 2), (2, 4), (4, 2), (4, 4)]
+        for part_index, (row, col) in enumerate(expected_core_tokens):
+            self.assertEqual(targets[0, part_index, row, col].item(), 1.0)
+        self.assertEqual(targets[0, 0, 2, 4].item(), 0.0)
+        self.assertEqual(targets[0, 3, 2, 2].item(), 0.0)
+
+    def test_part_route_loss_rewards_corresponding_part_regions(self):
+        bbox = torch.tensor([[0.25, 0.25, 0.50, 0.50]])
+        targets = build_vdrm_part_route_targets(
+            bbox,
+            height=8,
+            width=8,
+            num_parts=4,
+            dilation=0.0,
+        ).flatten(2)
+        good_logits = torch.where(
+            targets > 0.0,
+            torch.full_like(targets, 3.0),
+            torch.full_like(targets, -3.0),
+        ).requires_grad_()
+        bad_logits = torch.where(
+            targets.flip(1) > 0.0,
+            torch.full_like(targets, 3.0),
+            torch.full_like(targets, -3.0),
+        )
+        global_index = torch.arange(64).unsqueeze(0)
+
+        good_loss, diagnostics = compute_vdrm_part_route_loss(
+            good_logits,
+            global_index,
+            bbox,
+            grid_height=8,
+            grid_width=8,
+            dilation=0.0,
+        )
+        bad_loss, _ = compute_vdrm_part_route_loss(
+            bad_logits,
+            global_index,
+            bbox,
+            grid_height=8,
+            grid_width=8,
+            dilation=0.0,
+        )
+
+        self.assertLess(good_loss.item(), bad_loss.item())
+        self.assertGreater(
+            diagnostics["part_route_positive_probability"].item(),
+            diagnostics["part_route_background_probability"].item(),
+        )
+        good_loss.backward()
+        self.assertIsNotNone(good_logits.grad)
+        self.assertTrue(torch.isfinite(good_logits.grad).all())
 
     def test_candidate_consensus_prefers_colocated_multi_part_evidence(self):
         module = VisibilityDrivenRepresentationModule(

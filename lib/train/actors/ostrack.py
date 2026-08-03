@@ -1,6 +1,7 @@
 from . import BaseActor
 from lib.utils.misc import NestedTensor
 from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy
+import math
 import torch
 import torch.nn.functional as F
 from lib.utils.merge import merge_template_search
@@ -215,6 +216,196 @@ def compute_vdrm_candidate_focal_loss(
     return (
         per_sample_loss * valid_weight
     ).sum() / valid_weight.sum().clamp_min(1.0)
+
+
+def build_vdrm_part_route_targets(
+    search_bbox,
+    height,
+    width,
+    num_parts=4,
+    dilation=1.0,
+):
+    """Build soft search-grid targets for corresponding template parts.
+
+    The normalized target box is split using the same square layout as the
+    template prototypes. A part owns its complete sub-box, and supervision
+    decays outside that region over ``dilation`` feature cells. Tiny parts
+    that contain no cell center are assigned their nearest cell explicitly.
+    """
+    if search_bbox.ndim != 2 or search_bbox.shape[1] != 4:
+        raise ValueError(
+            "search_bbox must have shape [B, 4], got "
+            f"{tuple(search_bbox.shape)}"
+        )
+    part_grid = int(math.sqrt(num_parts))
+    if part_grid * part_grid != num_parts:
+        raise ValueError(
+            f"num_parts must be a square number, got {num_parts}"
+        )
+    if height < 1 or width < 1:
+        raise ValueError(
+            f"height and width must be positive, got {height}x{width}"
+        )
+    if dilation < 0.0:
+        raise ValueError(
+            f"dilation must be non-negative, got {dilation}"
+        )
+
+    bbox = search_bbox.clamp(0.0, 1.0)
+    x0, y0, box_width, box_height = bbox.unbind(dim=-1)
+    x1 = (x0 + box_width).clamp(0.0, 1.0)
+    y1 = (y0 + box_height).clamp(0.0, 1.0)
+    grid_y, grid_x = torch.meshgrid(
+        (torch.arange(height, device=bbox.device, dtype=bbox.dtype) + 0.5)
+        / height,
+        (torch.arange(width, device=bbox.device, dtype=bbox.dtype) + 0.5)
+        / width,
+        indexing='ij',
+    )
+    grid_x = grid_x.unsqueeze(0)
+    grid_y = grid_y.unsqueeze(0)
+
+    targets = []
+    for row in range(part_grid):
+        part_y0 = y0 + (y1 - y0) * (row / part_grid)
+        part_y1 = y0 + (y1 - y0) * ((row + 1) / part_grid)
+        for col in range(part_grid):
+            part_x0 = x0 + (x1 - x0) * (col / part_grid)
+            part_x1 = x0 + (x1 - x0) * ((col + 1) / part_grid)
+            distance_x = (
+                (part_x0[:, None, None] - grid_x).clamp_min(0.0)
+                + (grid_x - part_x1[:, None, None]).clamp_min(0.0)
+            ) * width
+            distance_y = (
+                (part_y0[:, None, None] - grid_y).clamp_min(0.0)
+                + (grid_y - part_y1[:, None, None]).clamp_min(0.0)
+            ) * height
+            squared_distance = distance_x.square() + distance_y.square()
+            if dilation > 0.0:
+                target = torch.exp(
+                    -0.5 * squared_distance / float(dilation) ** 2
+                )
+            else:
+                target = squared_distance.eq(0.0).to(bbox.dtype)
+
+            # Very small boxes can fall between feature-cell centers. Give
+            # every part one unambiguous core token before CE gathers it.
+            missing_core = ~target.eq(1.0).flatten(1).any(dim=1)
+            if missing_core.any():
+                nearest_index = squared_distance.flatten(1).argmin(
+                    dim=1, keepdim=True
+                )
+                nearest_mask = torch.zeros_like(target).flatten(1)
+                nearest_mask.scatter_(1, nearest_index, 1.0)
+                nearest_mask = nearest_mask.view_as(target)
+                target = torch.where(
+                    missing_core[:, None, None] & nearest_mask.bool(),
+                    torch.ones_like(target),
+                    target,
+                )
+            targets.append(target)
+    return torch.stack(targets, dim=1)
+
+
+def compute_vdrm_part_route_loss(
+    part_route_logits,
+    search_global_index,
+    search_bbox,
+    grid_height,
+    grid_width,
+    part_valid=None,
+    part_weight=None,
+    dilation=1.0,
+):
+    """Supervise V8 part routing with balanced soft region targets."""
+    if part_route_logits.ndim != 3:
+        raise ValueError(
+            "part_route_logits must have shape [B, K, L], got "
+            f"{tuple(part_route_logits.shape)}"
+        )
+    batch_size, num_parts, search_length = part_route_logits.shape
+    if search_global_index.shape != (batch_size, search_length):
+        raise ValueError(
+            "search_global_index must have shape [B, L], got "
+            f"{tuple(search_global_index.shape)}"
+        )
+
+    targets = build_vdrm_part_route_targets(
+        search_bbox.to(
+            device=part_route_logits.device,
+            dtype=part_route_logits.dtype,
+        ),
+        grid_height,
+        grid_width,
+        num_parts=num_parts,
+        dilation=dilation,
+    )
+    global_index = search_global_index.to(
+        device=part_route_logits.device, dtype=torch.long
+    )
+    if (
+        global_index.numel() == 0
+        or global_index.min() < 0
+        or global_index.max() >= grid_height * grid_width
+    ):
+        raise ValueError("search_global_index is outside the route grid")
+    retained_target = targets.flatten(2).gather(
+        2, global_index[:, None, :].expand(-1, num_parts, -1)
+    )
+
+    positive_mass = retained_target.sum(dim=-1)
+    negative_target = 1.0 - retained_target
+    negative_mass = negative_target.sum(dim=-1)
+    positive_loss = -(
+        retained_target * F.logsigmoid(part_route_logits)
+    ).sum(dim=-1) / positive_mass.clamp_min(1e-6)
+    negative_loss = -(
+        negative_target * F.logsigmoid(-part_route_logits)
+    ).sum(dim=-1) / negative_mass.clamp_min(1e-6)
+    per_part_loss = 0.5 * (positive_loss + negative_loss)
+
+    valid_weight = (
+        (positive_mass > 0.0) & (negative_mass > 0.0)
+    ).to(per_part_loss.dtype)
+    if part_valid is not None:
+        if part_valid.shape != (batch_size, num_parts):
+            raise ValueError(
+                "part_valid must have shape [B, K], got "
+                f"{tuple(part_valid.shape)}"
+            )
+        valid_weight = valid_weight * part_valid.to(
+            device=per_part_loss.device, dtype=per_part_loss.dtype
+        )
+    if part_weight is not None:
+        if part_weight.shape != (batch_size, num_parts):
+            raise ValueError(
+                "part_weight must have shape [B, K], got "
+                f"{tuple(part_weight.shape)}"
+            )
+        valid_weight = valid_weight * part_weight.to(
+            device=per_part_loss.device, dtype=per_part_loss.dtype
+        ).clamp(0.0, 1.0)
+    loss = (
+        per_part_loss * valid_weight
+    ).sum() / valid_weight.sum().clamp_min(1.0)
+
+    probability = torch.sigmoid(part_route_logits)
+    expanded_valid = valid_weight.unsqueeze(-1)
+    positive_probability = (
+        probability * retained_target * expanded_valid
+    ).sum() / (
+        retained_target * expanded_valid
+    ).sum().clamp_min(1e-6)
+    background_probability = (
+        probability * negative_target * expanded_valid
+    ).sum() / (
+        negative_target * expanded_valid
+    ).sum().clamp_min(1e-6)
+    diagnostics = {
+        "part_route_positive_probability": positive_probability,
+        "part_route_background_probability": background_probability,
+    }
+    return loss, diagnostics
 
 
 def compute_vdrm_response_rank_loss(
@@ -501,7 +692,9 @@ class OSTrackActor(BaseActor):
         visibility_loss = pred_boxes.new_zeros(())
         rank_loss = pred_boxes.new_zeros(())
         candidate_loss = pred_boxes.new_zeros(())
+        part_route_loss = pred_boxes.new_zeros(())
         rank_diagnostics = None
+        part_route_diagnostics = None
         aux_weight_scale = 0.0
 
         vdrm_cfg = getattr(self.cfg.MODEL, "VDRM", None)
@@ -611,6 +804,36 @@ class OSTrackActor(BaseActor):
                     gt_gaussian_maps.squeeze(1),
                     sample_valid=pred_dict.get('candidate_consensus_valid'),
                 )
+            elif spatial_gate_mode == 'part_aligned':
+                required_route_outputs = {
+                    'part_route_logits', 'search_global_index'
+                }
+                missing_route_outputs = required_route_outputs.difference(
+                    pred_dict
+                )
+                if missing_route_outputs:
+                    raise RuntimeError(
+                        "VDRM part-route loss is missing model outputs: "
+                        f"{sorted(missing_route_outputs)}"
+                    )
+                part_route_loss, part_route_diagnostics = (
+                    compute_vdrm_part_route_loss(
+                        pred_dict['part_route_logits'],
+                        pred_dict['search_global_index'],
+                        gt_bbox,
+                        gt_gaussian_maps.shape[-2],
+                        gt_gaussian_maps.shape[-1],
+                        part_valid=pred_dict.get('part_valid'),
+                        part_weight=pred_dict.get(
+                            'vdrm_visibility_target'
+                        ),
+                        dilation=getattr(
+                            self.cfg.TRAIN,
+                            'VDRM_PART_TARGET_DILATION',
+                            1.0,
+                        ),
+                    )
+                )
 
             warmup_epochs = self.cfg.TRAIN.VDRM_AUX_WARMUP_EPOCHS
             epoch = float(gt_dict.get('epoch', 1))
@@ -628,6 +851,7 @@ class OSTrackActor(BaseActor):
                 self.cfg.TRAIN.VDRM_VISIBILITY_WEIGHT * visibility_loss
                 + self.cfg.TRAIN.VDRM_RANK_WEIGHT * rank_loss
                 + self.cfg.TRAIN.VDRM_CANDIDATE_WEIGHT * candidate_loss
+                + self.cfg.TRAIN.VDRM_PART_ROUTE_WEIGHT * part_route_loss
             )
         if return_status:
             # status for log
@@ -642,6 +866,7 @@ class OSTrackActor(BaseActor):
                     "Loss/vdrm_visibility": visibility_loss.item(),
                     "Loss/vdrm_rank": rank_loss.item(),
                     "Loss/vdrm_candidate": candidate_loss.item(),
+                    "Loss/vdrm_part_route": part_route_loss.item(),
                     "VDRM/aux_weight_scale": aux_weight_scale,
                     "VDRM/alpha": pred_dict['vdrm_alpha'].detach().item()
                     if 'vdrm_alpha' in pred_dict else 0.0,
@@ -662,6 +887,19 @@ class OSTrackActor(BaseActor):
                         .mean()
                         .item()
                     )
+                if part_route_diagnostics is not None:
+                    status.update({
+                        "VDRM/part_route_positive_probability": (
+                            part_route_diagnostics[
+                                'part_route_positive_probability'
+                            ].detach().item()
+                        ),
+                        "VDRM/part_route_background_probability": (
+                            part_route_diagnostics[
+                                'part_route_background_probability'
+                            ].detach().item()
+                        ),
+                    })
                 if "vdrm_distractor_applied" in gt_dict:
                     status["VDRM/distractor_applied_rate"] = (
                         gt_dict["vdrm_distractor_applied"]
@@ -715,6 +953,12 @@ class OSTrackActor(BaseActor):
                     ),
                     "vdrm_delta_relative_norm": (
                         "VDRM/delta_relative_norm"
+                    ),
+                    "vdrm_residual_top10_energy_fraction": (
+                        "VDRM/residual_top10_energy_fraction"
+                    ),
+                    "vdrm_residual_spatial_entropy": (
+                        "VDRM/residual_spatial_entropy"
                     ),
                 }
                 for output_key, status_key in residual_status_keys.items():
