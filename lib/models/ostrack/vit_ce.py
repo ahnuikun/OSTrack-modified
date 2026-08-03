@@ -43,7 +43,10 @@ class VisionTransformerCE(VisionTransformer):
                   vdrm_candidate_local_radius=1,
                   vdrm_candidate_consensus_parts=2,
                   vdrm_candidate_initial_match_scale=5.0,
-                  vdrm_candidate_initial_match_bias=-2.5):
+                  vdrm_candidate_initial_match_bias=-2.5,
+                  vdrm_part_route_initial_match_scale=5.0,
+                  vdrm_part_route_initial_match_bias=-2.5,
+                  vdrm_alpha_max=0.0):
         """
         Args:
             img_size (int, tuple): input image size
@@ -131,6 +134,13 @@ class VisionTransformerCE(VisionTransformer):
                     vdrm_candidate_initial_match_scale
                 ),
                 candidate_initial_match_bias=vdrm_candidate_initial_match_bias,
+                part_route_initial_match_scale=(
+                    vdrm_part_route_initial_match_scale
+                ),
+                part_route_initial_match_bias=(
+                    vdrm_part_route_initial_match_bias
+                ),
+                alpha_max=vdrm_alpha_max,
             )
         else:
             self.vdrm = None

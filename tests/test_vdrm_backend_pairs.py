@@ -34,6 +34,19 @@ class VDRMBackendPairMetricsTest(unittest.TestCase):
         self.assertIsNot(baseline, vdrm)
         self.assertIsNot(baseline.MODEL, vdrm.MODEL)
 
+    def test_v8_part_aligned_config_is_registered(self):
+        _, _, v8 = load_config(
+            "vitb_256_mae_ce_vdrm_v8_par_hncp_32x4_ep300"
+        )
+
+        self.assertTrue(v8.MODEL.VDRM.ENABLED)
+        self.assertEqual(
+            v8.MODEL.VDRM.SPATIAL_GATE_MODE, "part_aligned"
+        )
+        self.assertEqual(v8.MODEL.VDRM.ALPHA_MAX, 1.5)
+        self.assertEqual(v8.TRAIN.VDRM_CANDIDATE_WEIGHT, 0.0)
+        self.assertEqual(v8.TRAIN.VDRM_PART_ROUTE_WEIGHT, 0.1)
+
     def test_map_box_back_uses_the_shared_anchor(self):
         mapped = map_box_back_from_anchor(
             predicted_box=[50.0, 50.0, 20.0, 10.0],

@@ -11,6 +11,10 @@ The first implementation intentionally keeps the design small:
   to each input search-token norm.
 * VDRM-v7 can require multiple template parts to agree inside one local
   search candidate before allowing a spatial residual update.
+* VDRM-v8 routes every template part to its own search locations and builds
+  the residual from the same calibrated part evidence. Its LayerScale is
+  bounded so a vanishing spatial gate cannot be offset by an unbounded
+  residual scalar.
 
 The original ``topk`` reliability is retained for VDRM-v1 checkpoint
 compatibility. VDRM-v2 uses the margin between a part's best match and its
@@ -46,6 +50,9 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         candidate_consensus_parts: int = 2,
         candidate_initial_match_scale: float = 5.0,
         candidate_initial_match_bias: float = -2.5,
+        part_route_initial_match_scale: float = 5.0,
+        part_route_initial_match_bias: float = -2.5,
+        alpha_max: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -68,10 +75,15 @@ class VisibilityDrivenRepresentationModule(nn.Module):
                 "residual_max_ratio must be non-negative, got "
                 f"{residual_max_ratio}"
             )
-        if spatial_gate_mode not in ("token_match", "candidate_consensus"):
+        if spatial_gate_mode not in (
+            "token_match",
+            "candidate_consensus",
+            "part_aligned",
+        ):
             raise ValueError(
-                "spatial_gate_mode must be 'token_match' or "
-                f"'candidate_consensus', got {spatial_gate_mode!r}"
+                "spatial_gate_mode must be 'token_match', "
+                "'candidate_consensus', or 'part_aligned', "
+                f"got {spatial_gate_mode!r}"
             )
         if candidate_local_radius < 0:
             raise ValueError(
@@ -83,6 +95,10 @@ class VisibilityDrivenRepresentationModule(nn.Module):
                 "candidate_consensus_parts must be in [1, num_parts], got "
                 f"{candidate_consensus_parts} for {num_parts} parts"
             )
+        if alpha_max < 0.0:
+            raise ValueError(
+                f"alpha_max must be non-negative, got {alpha_max}"
+            )
 
         self.num_parts = num_parts
         self.part_grid = part_grid
@@ -93,6 +109,7 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         self.spatial_gate_mode = spatial_gate_mode
         self.candidate_local_radius = int(candidate_local_radius)
         self.candidate_consensus_parts = int(candidate_consensus_parts)
+        self.alpha_max = float(alpha_max)
         self.eps = eps
 
         # A shared monotonic calibration is enough for the first version.
@@ -121,8 +138,62 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             self.register_parameter("candidate_log_match_scale", None)
             self.register_parameter("candidate_match_bias", None)
 
+        # V8 calibrates each part-to-token similarity independently. These
+        # parameters exist only in part-aligned mode, preserving all previous
+        # checkpoint schemas and forward paths.
+        if self.spatial_gate_mode == "part_aligned":
+            initial_part_route_scale = torch.tensor(
+                float(part_route_initial_match_scale)
+            )
+            self.part_route_log_match_scale = nn.Parameter(
+                torch.log(torch.expm1(initial_part_route_scale))
+            )
+            self.part_route_match_bias = nn.Parameter(
+                torch.tensor(float(part_route_initial_match_bias))
+            )
+        else:
+            self.register_parameter("part_route_log_match_scale", None)
+            self.register_parameter("part_route_match_bias", None)
+
         # Zero initialization preserves the original OSTrack forward path.
         self.alpha = nn.Parameter(torch.zeros(()))
+
+    def _effective_alpha(self) -> torch.Tensor:
+        """Return the residual LayerScale, optionally bounded for V8."""
+        if self.alpha_max <= 0.0:
+            return self.alpha
+        return self.alpha_max * torch.tanh(self.alpha / self.alpha_max)
+
+    def _part_aligned_statistics(
+        self,
+        similarity: torch.Tensor,
+        prototypes: torch.Tensor,
+        part_reliability: torch.Tensor,
+        part_valid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Route each part and build its residual from the same evidence.
+
+        Unlike V7, this path has no center-candidate gate. A calibrated map is
+        produced for every template part at the exact search locations where
+        that part's prototype is injected. Division by the fixed number of
+        valid parts keeps the residual scale identifiable without normalizing
+        away background suppression.
+        """
+        route_scale = F.softplus(self.part_route_log_match_scale)
+        route_logits = (
+            route_scale * similarity + self.part_route_match_bias
+        )
+        route_gate = torch.sigmoid(route_logits)
+        route_gate = route_gate * part_valid.unsqueeze(-1).to(
+            route_gate.dtype
+        )
+        route_weight = route_gate * part_reliability.unsqueeze(-1)
+        residual = torch.einsum(
+            "bkl,bkc->blc", route_weight, prototypes
+        )
+        valid_count = part_valid.sum(dim=1, keepdim=True).clamp_min(1)
+        residual = residual / valid_count.unsqueeze(-1).to(residual.dtype)
+        return route_logits, route_gate, residual
 
     def _candidate_consensus_statistics(
         self,
@@ -443,15 +514,32 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             part_reliability * part_valid.to(part_reliability.dtype)
         )
 
-        part_attention = torch.softmax(similarity, dim=1)
-        weighted_prototypes = (
-            prototypes * part_reliability.unsqueeze(-1)
-        )
-        reconstructed = torch.einsum(
-            "bkl,bkc->blc", part_attention, weighted_prototypes
-        )
-        token_match = similarity.max(dim=1).values.clamp_min(0.0)
-        residual = reconstructed * token_match.unsqueeze(-1)
+        route_diagnostics = {}
+        if self.spatial_gate_mode == "part_aligned":
+            part_route_logits, part_route_gate, residual = (
+                self._part_aligned_statistics(
+                    similarity,
+                    prototypes,
+                    part_reliability,
+                    part_valid,
+                )
+            )
+            route_diagnostics = {
+                "part_route_logits": part_route_logits,
+                "part_route_gate": part_route_gate,
+                "part_similarity": similarity,
+                "search_global_index": search_global_index,
+            }
+        else:
+            part_attention = torch.softmax(similarity, dim=1)
+            weighted_prototypes = (
+                prototypes * part_reliability.unsqueeze(-1)
+            )
+            reconstructed = torch.einsum(
+                "bkl,bkc->blc", part_attention, weighted_prototypes
+            )
+            token_match = similarity.max(dim=1).values.clamp_min(0.0)
+            residual = reconstructed * token_match.unsqueeze(-1)
         candidate_diagnostics = {}
         if self.spatial_gate_mode == "candidate_consensus":
             if search_global_index is None or search_grid_size is None:
@@ -480,7 +568,8 @@ class VisibilityDrivenRepresentationModule(nn.Module):
                 "candidate_reliability_mean": candidate_gate.mean(dim=1),
                 "search_global_index": search_global_index,
             }
-        raw_delta = self.alpha * residual
+        effective_alpha = self._effective_alpha()
+        raw_delta = effective_alpha * residual
 
         # V4 bounds the *complete* update after alpha, so the learned scalar
         # cannot compensate for the bound by growing in magnitude. The
@@ -515,6 +604,40 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             / safe_reference_norm
         ).mean()
 
+        residual_concentration_diagnostics = {}
+        if self.spatial_gate_mode == "part_aligned":
+            # Measure before LayerScale so zero initialization cannot hide a
+            # collapsed routing map during early V8 training.
+            residual_energy = residual.square().sum(dim=-1)
+            residual_energy_sum = residual_energy.sum(dim=1).clamp_min(
+                self.eps
+            )
+            top_count = max(
+                1, int(math.ceil(0.1 * residual_energy.shape[1]))
+            )
+            residual_top10_energy_fraction = (
+                residual_energy.topk(top_count, dim=1).values.sum(dim=1)
+                / residual_energy_sum
+            )
+            residual_probability = (
+                residual_energy / residual_energy_sum[:, None]
+            )
+            if residual_energy.shape[1] > 1:
+                residual_spatial_entropy = -(
+                    residual_probability
+                    * residual_probability.clamp_min(self.eps).log()
+                ).sum(dim=1) / math.log(residual_energy.shape[1])
+            else:
+                residual_spatial_entropy = residual_energy.new_zeros(
+                    batch_size
+                )
+            residual_concentration_diagnostics = {
+                "vdrm_residual_top10_energy_fraction": (
+                    residual_top10_energy_fraction
+                ),
+                "vdrm_residual_spatial_entropy": residual_spatial_entropy,
+            }
+
         template_tokens_out = template_tokens
         search_tokens_out = search_tokens + delta
         output_tokens = torch.cat(
@@ -533,11 +656,14 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "part_reliability": part_reliability,
             "part_valid": part_valid,
             "visual_reliability": visual_reliability,
-            "vdrm_alpha": self.alpha,
+            "vdrm_alpha": effective_alpha,
+            "vdrm_alpha_raw": self.alpha,
             "vdrm_residual_clip_rate": residual_clip_rate,
             "vdrm_raw_delta_relative_norm": raw_delta_relative_norm,
             "vdrm_delta_relative_norm": delta_relative_norm,
         }
         diagnostics.update(margin_diagnostics)
         diagnostics.update(candidate_diagnostics)
+        diagnostics.update(route_diagnostics)
+        diagnostics.update(residual_concentration_diagnostics)
         return output_tokens, diagnostics
