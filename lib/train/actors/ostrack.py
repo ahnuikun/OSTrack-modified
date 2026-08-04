@@ -786,7 +786,10 @@ class OSTrackActor(BaseActor):
             spatial_gate_mode = getattr(
                 vdrm_cfg, 'SPATIAL_GATE_MODE', 'token_match'
             )
-            if spatial_gate_mode == 'candidate_consensus':
+            if spatial_gate_mode in (
+                'candidate_consensus',
+                'part_aligned_consensus',
+            ):
                 required_candidate_outputs = {
                     'candidate_identity_logits', 'search_global_index'
                 }
@@ -804,7 +807,10 @@ class OSTrackActor(BaseActor):
                     gt_gaussian_maps.squeeze(1),
                     sample_valid=pred_dict.get('candidate_consensus_valid'),
                 )
-            elif spatial_gate_mode == 'part_aligned':
+            if spatial_gate_mode in (
+                'part_aligned',
+                'part_aligned_consensus',
+            ):
                 required_route_outputs = {
                     'part_route_logits', 'search_global_index'
                 }

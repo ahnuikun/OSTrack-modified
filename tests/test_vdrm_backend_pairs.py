@@ -47,6 +47,22 @@ class VDRMBackendPairMetricsTest(unittest.TestCase):
         self.assertEqual(v8.TRAIN.VDRM_CANDIDATE_WEIGHT, 0.0)
         self.assertEqual(v8.TRAIN.VDRM_PART_ROUTE_WEIGHT, 0.1)
 
+    def test_v9_candidate_consistent_part_routing_config_is_registered(self):
+        _, _, v9 = load_config(
+            "vitb_256_mae_ce_vdrm_v9_pacr_hncp_32x4_ep300"
+        )
+
+        self.assertTrue(v9.MODEL.VDRM.ENABLED)
+        self.assertEqual(
+            v9.MODEL.VDRM.SPATIAL_GATE_MODE,
+            "part_aligned_consensus",
+        )
+        self.assertEqual(v9.MODEL.VDRM.CANDIDATE_LOCAL_RADIUS, 1)
+        self.assertEqual(v9.MODEL.VDRM.CANDIDATE_CONSENSUS_PARTS, 3)
+        self.assertEqual(v9.MODEL.VDRM.ALPHA_MAX, 1.5)
+        self.assertEqual(v9.TRAIN.VDRM_CANDIDATE_WEIGHT, 0.1)
+        self.assertEqual(v9.TRAIN.VDRM_PART_ROUTE_WEIGHT, 0.1)
+
     def test_map_box_back_uses_the_shared_anchor(self):
         mapped = map_box_back_from_anchor(
             predicted_box=[50.0, 50.0, 20.0, 10.0],

@@ -15,6 +15,10 @@ The first implementation intentionally keeps the design small:
   the residual from the same calibrated part evidence. Its LayerScale is
   bounded so a vanishing spatial gate cannot be offset by an unbounded
   residual scalar.
+* VDRM-v9 keeps the supervised V8 part routes, but only injects their
+  residual where several routed parts support the same local candidate. The
+  candidate gate is detached from the tracking loss, so only its explicit
+  target supervision can calibrate it.
 
 The original ``topk`` reliability is retained for VDRM-v1 checkpoint
 compatibility. VDRM-v2 uses the margin between a part's best match and its
@@ -79,10 +83,12 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             "token_match",
             "candidate_consensus",
             "part_aligned",
+            "part_aligned_consensus",
         ):
             raise ValueError(
                 "spatial_gate_mode must be 'token_match', "
-                "'candidate_consensus', or 'part_aligned', "
+                "'candidate_consensus', 'part_aligned', or "
+                "'part_aligned_consensus', "
                 f"got {spatial_gate_mode!r}"
             )
         if candidate_local_radius < 0:
@@ -121,10 +127,13 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
         self.match_bias = nn.Parameter(torch.tensor(float(initial_match_bias)))
 
-        # Candidate calibration is instantiated only for V7. Keeping these
-        # parameters absent in the default mode preserves the exact V1-V6
-        # state-dict contract for existing checkpoints.
-        if self.spatial_gate_mode == "candidate_consensus":
+        # Candidate calibration is used by V7 and V9. Keeping these parameters
+        # absent in the other modes preserves every previous checkpoint
+        # contract.
+        if self.spatial_gate_mode in (
+            "candidate_consensus",
+            "part_aligned_consensus",
+        ):
             initial_candidate_scale = torch.tensor(
                 float(candidate_initial_match_scale)
             )
@@ -138,10 +147,12 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             self.register_parameter("candidate_log_match_scale", None)
             self.register_parameter("candidate_match_bias", None)
 
-        # V8 calibrates each part-to-token similarity independently. These
-        # parameters exist only in part-aligned mode, preserving all previous
-        # checkpoint schemas and forward paths.
-        if self.spatial_gate_mode == "part_aligned":
+        # V8/V9 calibrate each part-to-token similarity independently. These
+        # parameters remain absent from every earlier forward path.
+        if self.spatial_gate_mode in (
+            "part_aligned",
+            "part_aligned_consensus",
+        ):
             initial_part_route_scale = torch.tensor(
                 float(part_route_initial_match_scale)
             )
@@ -197,7 +208,7 @@ class VisibilityDrivenRepresentationModule(nn.Module):
 
     def _candidate_consensus_statistics(
         self,
-        similarity: torch.Tensor,
+        part_evidence: torch.Tensor,
         part_reliability: torch.Tensor,
         part_valid: torch.Tensor,
         search_global_index: torch.Tensor,
@@ -206,26 +217,27 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         """Build a candidate-level reliability gate from local part agreement.
 
         Each retained token is treated as a candidate location. For every
-        template part, the strongest positive match in a fixed local
-        neighbourhood is collected on the original search grid. The gate is
-        calibrated from the strongest ``candidate_consensus_parts`` part
-        matches, so one isolated part or spatially scattered matches cannot
-        enable the residual by themselves.
+        template part, the strongest positive evidence in a fixed local
+        neighbourhood is collected on the original search grid. V7 supplies
+        raw similarities and V9 supplies supervised part-route probabilities.
+        The gate is calibrated from the strongest
+        ``candidate_consensus_parts`` values, so one isolated part or
+        spatially scattered evidence cannot enable the residual by itself.
         """
         if search_grid_size < 1:
             raise ValueError(
                 f"search_grid_size must be positive, got {search_grid_size}"
             )
-        batch_size, num_parts, search_length = similarity.shape
+        batch_size, num_parts, search_length = part_evidence.shape
         if search_global_index.shape != (batch_size, search_length):
             raise ValueError(
                 "search_global_index must have shape [B, L_s], got "
-                f"{tuple(search_global_index.shape)} for similarity "
-                f"{tuple(similarity.shape)}"
+                f"{tuple(search_global_index.shape)} for part evidence "
+                f"{tuple(part_evidence.shape)}"
             )
 
         global_index = search_global_index.to(
-            device=similarity.device, dtype=torch.long
+            device=part_evidence.device, dtype=torch.long
         )
         full_length = search_grid_size ** 2
         if (
@@ -238,39 +250,39 @@ class VisibilityDrivenRepresentationModule(nn.Module):
                 f"{search_grid_size}x{search_grid_size} search grid"
             )
 
-        weighted_similarity = (
-            similarity.clamp_min(0.0) * part_reliability.unsqueeze(-1)
+        weighted_evidence = (
+            part_evidence.clamp_min(0.0) * part_reliability.unsqueeze(-1)
         )
-        weighted_similarity = weighted_similarity * part_valid.unsqueeze(
+        weighted_evidence = weighted_evidence * part_valid.unsqueeze(
             -1
-        ).to(weighted_similarity.dtype)
-        full_similarity = similarity.new_zeros(
+        ).to(weighted_evidence.dtype)
+        full_evidence = part_evidence.new_zeros(
             batch_size, num_parts, full_length
         )
-        full_similarity.scatter_(
+        full_evidence.scatter_(
             2,
             global_index[:, None, :].expand(-1, num_parts, -1),
-            weighted_similarity,
+            weighted_evidence,
         )
-        full_similarity = full_similarity.view(
+        full_evidence = full_evidence.view(
             batch_size, num_parts, search_grid_size, search_grid_size
         )
 
         radius = self.candidate_local_radius
         if radius > 0:
-            local_similarity = F.max_pool2d(
-                full_similarity,
+            local_evidence = F.max_pool2d(
+                full_evidence,
                 kernel_size=2 * radius + 1,
                 stride=1,
                 padding=radius,
             )
         else:
-            local_similarity = full_similarity
-        local_similarity = local_similarity.flatten(2).gather(
+            local_evidence = full_evidence
+        local_evidence = local_evidence.flatten(2).gather(
             2, global_index[:, None, :].expand(-1, num_parts, -1)
         )
 
-        consensus_values = local_similarity.topk(
+        consensus_values = local_evidence.topk(
             self.candidate_consensus_parts, dim=1
         ).values
         candidate_evidence = consensus_values.mean(dim=1)
@@ -288,7 +300,7 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
         candidate_gate = torch.sigmoid(candidate_logits)
 
-        candidate_map = similarity.new_zeros(batch_size, full_length)
+        candidate_map = part_evidence.new_zeros(batch_size, full_length)
         candidate_map.scatter_(1, global_index, candidate_gate)
         candidate_map = candidate_map.view(
             batch_size, 1, search_grid_size, search_grid_size
@@ -515,7 +527,11 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         )
 
         route_diagnostics = {}
-        if self.spatial_gate_mode == "part_aligned":
+        part_route_gate = None
+        if self.spatial_gate_mode in (
+            "part_aligned",
+            "part_aligned_consensus",
+        ):
             part_route_logits, part_route_gate, residual = (
                 self._part_aligned_statistics(
                     similarity,
@@ -541,25 +557,43 @@ class VisibilityDrivenRepresentationModule(nn.Module):
             token_match = similarity.max(dim=1).values.clamp_min(0.0)
             residual = reconstructed * token_match.unsqueeze(-1)
         candidate_diagnostics = {}
-        if self.spatial_gate_mode == "candidate_consensus":
+        if self.spatial_gate_mode in (
+            "candidate_consensus",
+            "part_aligned_consensus",
+        ):
             if search_global_index is None or search_grid_size is None:
                 raise ValueError(
                     "candidate-consensus gating requires search_global_index "
                     "and search_grid_size"
                 )
+            candidate_evidence = similarity
+            if self.spatial_gate_mode == "part_aligned_consensus":
+                if part_route_gate is None:
+                    raise RuntimeError(
+                        "part-aligned consensus requires part-route evidence"
+                    )
+                candidate_evidence = part_route_gate
             (
                 candidate_logits,
                 candidate_gate,
                 candidate_map,
                 consensus_valid,
             ) = self._candidate_consensus_statistics(
-                similarity,
+                candidate_evidence,
                 part_reliability,
                 part_valid,
                 search_global_index,
                 int(search_grid_size),
             )
-            residual = residual * candidate_gate.unsqueeze(-1)
+            residual_candidate_gate = candidate_gate
+            if self.spatial_gate_mode == "part_aligned_consensus":
+                # The tracking objective must not learn to close the spatial
+                # gate and compensate with LayerScale. Candidate focal loss
+                # still trains the gate (and its part-route evidence) through
+                # candidate_logits, while the bounded alpha learns only the
+                # magnitude of an accepted residual.
+                residual_candidate_gate = residual_candidate_gate.detach()
+            residual = residual * residual_candidate_gate.unsqueeze(-1)
             candidate_diagnostics = {
                 "candidate_identity_logits": candidate_logits,
                 "candidate_reliability_map": candidate_map,
@@ -605,9 +639,12 @@ class VisibilityDrivenRepresentationModule(nn.Module):
         ).mean()
 
         residual_concentration_diagnostics = {}
-        if self.spatial_gate_mode == "part_aligned":
+        if self.spatial_gate_mode in (
+            "part_aligned",
+            "part_aligned_consensus",
+        ):
             # Measure before LayerScale so zero initialization cannot hide a
-            # collapsed routing map during early V8 training.
+            # collapsed routing map during early V8/V9 training.
             residual_energy = residual.square().sum(dim=-1)
             residual_energy_sum = residual_energy.sum(dim=1).clamp_min(
                 self.eps
